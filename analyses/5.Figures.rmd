@@ -1,0 +1,670 @@
+---
+title: "5.Figures"
+author: "Francis Leblanc"
+date: "23/06/2022"
+output:   
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: false
+    code_folding: show 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = TRUE,
+	warning = FALSE
+)
+library(Seurat)
+library(Signac)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(patchwork)
+library(GenomicRanges)
+library(ROCR)
+library(UpSetR)
+library(grid)
+
+theme_set(theme_cowplot())
+
+set.seed(2022)
+```
+
+
+# Fig. 2 - Compare links Z-scores before and after downsampling
+
+```{r}
+# pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+links.downsampled <- readRDS("../results/pbmc500_links_r0.01.rds")
+links0.1 <- readRDS("../results/links_signac_200null.r0.1.multimode.rds")
+ct.count <- readRDS("../data/ct.count.rds")
+top.ct <- names(ct.count[ct.count > 50])
+```
+
+## match downsampled and full dataset peaks by overlap
+
+```{r}
+ol <- findOverlaps(StringToGRanges(links.downsampled$peak),
+                   StringToGRanges(links0.1$peak))
+
+colnames(links.downsampled) <- paste0("pbmc500_", colnames(links.downsampled))
+combined.res <- cbind(links0.1[ol@to,],
+                      as.data.frame(links.downsampled[ol@from,]))
+
+combined.res <- combined.res %>% dplyr::filter(gene == pbmc500_gene)
+```
+
+## T-test for Z-scores before and after downsampling
+```{r}
+# levels by median Z-scores
+lvs.by.median <- combined.res %>% 
+  group_by(ct_top_auc) %>% 
+  summarise(median = median(abs(zscore))) %>% 
+  arrange(median) %>% 
+  pull(ct_top_auc)
+
+combined.res$ct_top_auc <- factor(combined.res$ct_top_auc, levels = lvs.by.median)
+
+# run t-test by celltype and keep confidence intervals
+l.ttests <- lapply(lvs.by.median, function(x){
+  df <- combined.res %>% 
+    dplyr::filter(ct_top_auc == x) %>% 
+    dplyr::select(pbmc500_zscore, zscore) %>% 
+    reshape2::melt()
+  df$value <- abs(df$value)
+  S <- t.test(paired = F, value ~ variable, data = df)
+  S <- c(S$conf.int[1:2], S$estimate, S$p.value)
+  S
+})
+df.ttest <- do.call(rbind, l.ttests) %>% as.data.frame()
+df.ttest$mean <- df.ttest[,3] - df.ttest[,4]
+colnames(df.ttest)[c(1,2,5)] <- c("lower", "upper", "p")
+df.ttest$ct <- factor(lvs.by.median, levels = lvs.by.median)
+df.ttest <- df.ttest %>% rstatix::add_significance("p")
+
+p.se <-ggplot(df.ttest, aes(x = ct, y = mean, ymin = lower, ymax = upper)) + 
+  geom_pointrange() + 
+  geom_hline(yintercept=0, linetype="longdash", color = "darkred") +
+  annotate("text", y = -1.3, x = df.ttest$ct, label = df.ttest$p.signif) +
+  coord_flip() +
+  theme(axis.text.y = element_blank()) +
+  xlab("") +
+  ylab("Differences (mean and standard error) \nbetween peak-gene Z-scores calculated \nafter and before down-sampling MP")
+
+# show cell count in each celltype with > 50 cells
+df <- as.data.frame(ct.count)
+colnames(df) <- c("ct","freq")
+
+df <- df %>% dplyr::filter(ct %in% top.ct)
+df$ct <- factor(df$ct, levels = lvs.by.median)
+df[18,] <- c("not.specific", 0) # not.specific peaks
+
+p.bar <- ggplot(df ,aes(x = ct, y = as.numeric(freq))) + 
+  geom_col() + 
+  ggpubr::rotate() +
+  theme(axis.text.y = element_blank()) +
+  xlab("") + ylab("Cell count") + NoLegend()
+
+m <- reshape2::melt(combined.res[, c("pbmc500_zscore" ,"zscore", "ct_top_auc")], 
+               measure.vars = , 
+               id.vars = "ct_top_auc")
+
+### boxplot of Z-scores by celltype before and after downsampling
+p.box <- ggplot(m, aes(x=abs(value), y=ct_top_auc, fill=variable)) + 
+  geom_point(shape = ".", color="black", size=0.5, alpha=0.5, position = position_jitterdodge()) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5)+
+  theme(legend.position = c(0.55, 0.3)) +
+  ylab("") + xlab("|Z-score|")+
+  scale_fill_manual(values = c("darkred", "gray"), 
+                    labels = c("Down-sampled MP" ,"All PBMC")) + 
+  labs(fill = "")
+
+ggsave(plot = p.box + p.bar + p.se ,"../figs/5_out/split_boxplot_Zscores_celltypes_links_abs0.1_SE_unpaired.png", width = 14, height = 7)
+```
+
+# Fig.S3 - Correlations with number of cells within a celltype
+
+## correlation bimodal peak count vs cell count
+
+```{r}
+# get % of links with bimodal null
+bimod.count <- links0.1 %>% 
+  group_by(ct_top_auc, .drop = FALSE) %>% 
+  tally(multimodal) 
+
+bimod.count$ct_marker.count <- links0.1 %>% 
+  group_by(ct_top_auc) %>% 
+  tally() %>% 
+  pull(n)
+
+bimod.count$bimod.pct <- round((100 * bimod.count$n) / bimod.count$ct_marker.count)
+bimod.count <- bimod.count %>% 
+  arrange(desc(bimod.pct)) %>%
+  mutate(ct_top_auc = factor(ct_top_auc, levels = ct_top_auc))
+
+# sort by median Z-scores
+df <- as.data.frame(ct.count)
+colnames(df) <- c("ct","freq")
+df <- df %>% dplyr::filter(ct %in% top.ct)
+df$ct <- factor(df$ct, levels = lvs.by.median)
+df$bimod.pct <- bimod.count$bimod.pct[match(df$ct, bimod.count$ct_top_auc)]
+
+p <- ggscatter(df, x="freq", y="bimod.pct",
+               cor.coef = T, 
+               cor.method = "spearman",
+               xlab = "Number of cells per cell-type", 
+               ylab = "Percentage of bimodal distributions",
+               label = "ct",
+               repel = T, cor.coef.coord = c(100,60))
+
+ggsave(plot = p, "../figs/5_out/bimodality.pct.vs.cellcount.png", width = 7, height = 5)
+```
+
+## Scatter: Relation of celltype count vs median -Log10(P)
+
+```{r}
+median_log10P <- links0.1 %>% 
+  dplyr::group_by(ct_top_auc) %>% 
+  summarise(median.log10p = median(-log10(pvalue))) %>% 
+  as.data.frame()
+
+median_log10P$n_cells <- ct.count[as.character(median_log10P$ct_top_auc)] %>% as.vector()
+
+p <- ggscatter(median_log10P, x="n_cells", y="median.log10p",
+               cor.coef = T, 
+               cor.method = "spearman",
+               xlab = "Number of cells per cell-type", 
+               ylab = "Median observed link -log10(P)",
+               label = "ct_top_auc",
+               repel = T, cor.coef.coord = c(100,7))
+
+ggsave(plot = p, "../figs/5_out/median-log10P.vs.cellcount.png", width = 7, height = 5)
+```
+
+## Scatter: Relation of celltype count vs max -Log10(P)
+
+```{r}
+Max.log10p <- links0.1 %>% 
+  dplyr::group_by(ct_top_auc) %>% 
+  summarise(Max.log10p = max(-log10(pvalue))) %>% 
+  as.data.frame()
+
+Max.log10p$n_cells <- ct.count[as.character(Max.log10p$ct_top_auc)] %>% as.vector()
+
+p <- ggscatter(Max.log10p, x="n_cells", y="Max.log10p",
+               cor.coef = T, 
+               cor.method = "spearman",
+               xlab = "Number of cells per cell-type", 
+               ylab = "Max observed link -log10(P)",
+               label = "ct_top_auc",
+               repel = T, cor.coef.coord = c(100,135))
+
+ggsave(plot = p, "../figs/5_out/max-log10P.vs.cellcount.png", width = 7, height = 5)
+```
+
+# Fig. 3 & S8-S9 - Prepare Epimap data
+## Pseudobulk 
+
+```{r}
+# combine Epimap info with models tested
+links0.1 <- readRDS("../results/links0.1_epimap.labels_ZINB.rds")
+links0.1.multi <- readRDS("../results/links_signac_200null.r0.1.multimode.rds")
+links0.1 <- merge(links0.1, 
+                  links0.1.multi[,c("gene_peak", "H0.p", "multimodal")],
+                  by = "gene_peak")
+
+links0.1$Pearson_dist <- links0.1$score * exp(-links0.1$link.width/200000)
+ct.epimap <- c("CD14_epimap","B_epimap","NK_epimap")
+
+# include RegNMF
+RegNMF <- readRDS("../results/RegNMF/RegNMF.scores_pbmc_links_hits.rds")
+RegNMF$gene_peak <- gsub(":","-",RegNMF$gene_peak)
+RegNMF <- RegNMF %>% dplyr::filter(gene_peak %in% links0.1$gene_peak)
+
+RegNMF <- cbind(
+  RegNMF,
+  links0.1[match(RegNMF$gene_peak, links0.1$gene_peak), ct.epimap]
+  )
+Regnmf.cols <- c("CD14 Mono","B_cell","NK")
+```
+
+## By celltype subset
+We need to get Epimap links overlap again because links might differ with pseudobulk links
+```{r}
+ct.ZINB <- readRDS("../results/celltype_subsetted.links0.1_ZINB.rds")
+
+gr.ct.ZINB <- StringToGRanges(ct.ZINB$peak)
+
+gr.ct.ZINB@elementMetadata <- ct.ZINB %>% 
+  dplyr::select(-c(seqnames:strand)) %>% 
+  DataFrame()
+
+epimap.path <- "../data/Epimap/"
+
+l <- lapply(ct.epimap, function(i){
+  # subset by celltype
+  epimap.gr <- readRDS(paste0(epimap.path, i, ".gr.rds"))
+  sub.gr.ct.ZINB <- gr.ct.ZINB[gr.ct.ZINB$celltype == gsub("_epimap","",i)]
+  
+  # find overlap for subsetted PBMC test
+  ovelaping_peaks <- findOverlaps(sub.gr.ct.ZINB, epimap.gr)
+  
+  df <- cbind(sub.gr.ct.ZINB@elementMetadata[ovelaping_peaks@from,], 
+              epimap.gr@elementMetadata[ovelaping_peaks@to,]) %>% 
+    as.data.frame()
+  
+  # keep overlapping peaks with same genes
+  epimap.positive.links <- df %>% 
+    filter(gene == gene_name) %>% 
+    pull(gene_peak) %>% 
+    unique()
+  
+  # label links validation TRUE if present in Epimap
+  sub.gr.ct.ZINB@elementMetadata[[i]] <- ifelse(
+    sub.gr.ct.ZINB$gene_peak %in% epimap.positive.links, 
+    TRUE, 
+    FALSE
+  )
+  
+  df <- sub.gr.ct.ZINB@elementMetadata %>% as.data.frame()
+  data.frame(gene_peak = df$gene_peak, 
+             epimap.validated = df[[i]],
+             celltype = df$celltype
+  )
+})
+
+epimap.ct <- do.call(rbind,l)
+ct.ZINB <- merge(ct.ZINB, epimap.ct, by=c("gene_peak","celltype"))
+```
+
+## Upset gene_peak overlap by Epimap celltype
+
+```{r}
+gr.links0.1 <- StringToGRanges(links0.1$peak)
+
+gr.links0.1@elementMetadata <- DataFrame(links0.1)
+
+epimap.path <- "../data/Epimap/"
+
+lapply(ct.epimap, function(i){
+  # subset epimap by celltype
+  epimap.gr <- readRDS(paste0(epimap.path, i, ".gr.rds"))
+  sub.gr.ct.ZINB <- gr.ct.ZINB[gr.ct.ZINB$celltype == gsub("_epimap","",i)]
+  
+  #####  find overlap for subsetted PBMC test
+  ovelaping_peaks <- findOverlaps(sub.gr.ct.ZINB, epimap.gr)
+  
+  keep <- which(epimap.gr[ovelaping_peaks@to]$gene_name ==
+                  sub.gr.ct.ZINB[ovelaping_peaks@from]$gene)
+  ovelaping_links <- ovelaping_peaks[keep]
+  
+  # change Epimap gene_peak to match its overlaping peak in PBMC
+  epimap.gr[ovelaping_links@to]$gene_peak <- sub.gr.ct.ZINB$gene_peak[ovelaping_links@from]
+
+  ##### find overlap for pseudobulk PBMC test
+  ovelaping_peaks <- findOverlaps(gr.links0.1, epimap.gr)
+  
+  keep <- which(epimap.gr[ovelaping_peaks@to]$gene_name ==
+                  gr.links0.1[ovelaping_peaks@from]$gene)
+  ovelaping_links <- ovelaping_peaks[keep]
+  
+  # change Epimap gene_peak to match its overlaping peak in PBMC
+  epimap.gr[ovelaping_links@to]$gene_peak <- gr.links0.1$gene_peak[ovelaping_links@from]
+
+  # labels
+  ct <- gsub("_epimap","",i)
+  upset_title <- paste0(ct, " links overlap")
+  
+  l_upset <- list(epimap.gr$gene_peak %>% unique(),
+            sub.gr.ct.ZINB$gene_peak %>% unique(),
+            links0.1$gene_peak %>% unique())
+  names(l_upset) <- c(paste0("Epimap ", ct ," predictions"), 
+                paste0("Subsetted ", ct ," links"), 
+                "Pseudo-bulk PBMC links")
+  
+  # save plot
+  png(paste0("../figs/5_out/upset.Epimap_",ct,".png"), res = 600, width = 6, height = 4, units = "in")
+  print(upset(fromList(l_upset), order.by = "freq"))
+  dev.off()
+})
+```
+
+# Fig. 3 & S8-S9 - plot ROC Epimap 
+## Pseudobulk
+### Pearson R > 0.1
+
+```{r}
+tests <- list(c("zscore","Z-scores"),
+              c("ZINB_Zvalue", "ZINB"),
+              c("score","Pearson R"),
+              c("Pearson_dist", "Pearson R * wDist"),
+              c("dist", "1/Distance"))
+
+links0.1$dist <- 1/links0.1$link.width
+
+l.p <- lapply(1:3, function(i){
+  l.df <- lapply(tests, function(test){
+    
+    links0.1.sub <- links0.1[!is.na(links0.1[[test[1]]]),]
+    
+    pred_ROCR <- prediction(abs(links0.1.sub[[test[1]]]), links0.1.sub[[ct.epimap[i]]])
+    roc_ROCR <- performance(pred_ROCR, measure = "tpr", x.measure = "fpr")
+    auc_ROCR <- performance(pred_ROCR, measure = "auc")
+    
+    data.frame(FPR = roc_ROCR@x.values[[1]], 
+               TPR = roc_ROCR@y.values[[1]], 
+               test = test[2],
+               AUC = auc_ROCR@y.values[[1]])
+  })
+  df <- do.call(rbind,l.df)
+  
+  # RegNMF
+  RegNMF.sub <- RegNMF[!is.na(RegNMF[[Regnmf.cols[i]]]),]
+  
+  pred_ROCR <- prediction(RegNMF.sub[[Regnmf.cols[i]]], RegNMF.sub[[ct.epimap[i]]])
+  roc_ROCR <- performance(pred_ROCR, measure = "tpr", x.measure = "fpr")
+  auc_ROCR <- performance(pred_ROCR, measure = "auc")
+  
+  df0 <- data.frame(FPR = roc_ROCR@x.values[[1]], 
+                    TPR = roc_ROCR@y.values[[1]], 
+                    test = "scREG",
+                    AUC = auc_ROCR@y.values[[1]])  
+  df <- rbind(df,df0)
+  
+  AUCs <- df %>% 
+    group_by(AUC,test) %>% 
+    summarise() %>% 
+    arrange(desc(AUC)) %>% 
+    as.data.frame()
+  df$test <- factor(df$test, levels = AUCs$test)
+  
+  AUCs$AUC <- AUCs$AUC %>% round(3)
+  
+  AUCs.labs <- c()
+  for (j in 1:nrow(AUCs)) {
+    AUCs.labs <- c(AUCs.labs, paste0(AUCs[j,"test"], " = ", AUCs[j,"AUC"]))
+  }
+  
+  ggplot(df, aes(FPR ,TPR, colour = test)) +
+    geom_line() +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+    theme(legend.position = c(0.55, 0.3)) + 
+    scale_color_discrete(labels = AUCs.labs) + 
+    labs(colour = "AUC")
+})
+
+ggsave(plot = l.p[[1]], "../figs/5_out/pseudobulk/CD14_ROC.png", width = 8, height = 8)
+ggsave(plot = l.p[[2]], "../figs/5_out/pseudobulk/B_ROC.png", width = 8, height = 8)
+ggsave(plot = l.p[[3]], "../figs/5_out/pseudobulk/NK_ROC.png", width = 8, height = 8)
+```
+
+### Pearson R > 0.01
+
+```{r}
+links0.01 <- readRDS("../results/links0.01_Epimap.labeled.rds")
+
+ct.epimap <- c("CD14_epimap","B_epimap","NK_epimap")
+
+tests <- list(c("zscore","Z-scores"),
+              c("score","Pearson R"))
+
+l.p <- lapply(1:3, function(i){
+  l.df <- lapply(tests, function(test){
+
+    pred_ROCR <- prediction(abs(links0.01[[test[1]]]), links0.01[[ct.epimap[i]]])
+    roc_ROCR <- performance(pred_ROCR, measure = "tpr", x.measure = "fpr")
+    auc_ROCR <- performance(pred_ROCR, measure = "auc")
+    
+    data.frame(FPR = roc_ROCR@x.values[[1]], 
+               TPR = roc_ROCR@y.values[[1]], 
+               test = test[2],
+               AUC = auc_ROCR@y.values[[1]])
+  })
+  df <- do.call(rbind,l.df)
+  
+  AUCs <- df %>% 
+    group_by(AUC,test) %>% 
+    summarise() %>% 
+    arrange(desc(AUC)) %>% 
+    as.data.frame()
+  df$test <- factor(df$test, levels = AUCs$test)
+  
+  AUCs$AUC <- AUCs$AUC %>% round(3)
+  
+  AUCs.labs <- c()
+  for (j in 1:nrow(AUCs)) {
+    AUCs.labs <- c(AUCs.labs, paste0(AUCs[j,"test"], " = ", AUCs[j,"AUC"]))
+  }
+  
+  ggplot(df, aes(FPR ,TPR, colour = test)) +
+    geom_line() +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+    theme(legend.position = c(0.55, 0.3)) + 
+    scale_color_discrete(labels = AUCs.labs) + 
+    labs(colour = "AUC")
+})
+
+ggsave(plot = l.p[[1]], "../figs/5_out/pseudobulk/R0.01_CD14_ROC.png", width = 8, height = 8)
+ggsave(plot = l.p[[2]], "../figs/5_out/pseudobulk/R0.01_B_ROC.png", width = 8, height = 8)
+ggsave(plot = l.p[[3]], "../figs/5_out/pseudobulk/R0.01_NK_ROC.png", width = 8, height = 8)
+```
+
+## Subsetted celltypes
+
+```{r}
+celltypes <- factor(c("CD14","B","NK"))
+tests <- list(c("zscore","Z-scores"),
+              c("ZINB_Zvalue", "ZINB"),
+              c("score","Pearson R"))
+
+l.p <- lapply(1:3, function(i){
+  l.df <- lapply(tests, function(test) {
+    
+    sub.ct.ZINB <- ct.ZINB %>% dplyr::filter(celltype == celltypes[i])
+    sub.ct.ZINB <- sub.ct.ZINB[!is.na(sub.ct.ZINB[[test[1]]]),]
+
+    pred_ROCR <- prediction(abs(sub.ct.ZINB[[test[1]]]), sub.ct.ZINB[["epimap.validated"]])
+    roc_ROCR <- performance(pred_ROCR, measure = "tpr", x.measure = "fpr")
+    auc_ROCR <- performance(pred_ROCR, measure = "auc")
+    
+    data.frame(FPR = roc_ROCR@x.values[[1]], 
+               TPR = roc_ROCR@y.values[[1]], 
+               test = test[2],
+               AUC = auc_ROCR@y.values[[1]])
+  })
+  
+  
+  df <- do.call(rbind,l.df)
+  
+  AUCs <- df %>% 
+    group_by(AUC,test) %>% 
+    summarise() %>% 
+    arrange(desc(AUC)) %>% 
+    as.data.frame()
+  df$test <- factor(df$test, levels = AUCs$test)
+  
+  AUCs$AUC <- AUCs$AUC %>% round(3)
+  
+  AUCs.labs <- c()
+  for (j in 1:nrow(AUCs)) {
+    AUCs.labs <- c(AUCs.labs, paste0(AUCs[j,"test"], " = ", AUCs[j,"AUC"]))
+  }
+  
+  ggplot(df, aes(FPR ,TPR, colour = test)) +
+    geom_line() +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+    theme(legend.position = c(0.55, 0.3)) + 
+    scale_color_discrete(labels = AUCs.labs) + 
+    labs(colour = "AUC")
+})
+
+
+ggsave(plot = l.p[[1]], "../figs/5_out/celltype_subset/CD14_ROC.png", width = 8, height = 8)
+ggsave(plot = l.p[[2]], "../figs/5_out/celltype_subset/B_ROC.png", width = 8, height = 8)
+ggsave(plot = l.p[[3]], "../figs/5_out/celltype_subset/NK_ROC.png", width = 8, height = 8)
+```
+
+# Fig. 4 - Prepare CRISPRi data
+
+```{r}
+CRISPRi.validation <- readRDS("../results/CRISPR.validation_celltype_subsetted_ZINB.rds")
+PB_CRISPRi <- readRDS("../results/links0.01_CRISPR_overlap.rds") %>% 
+  as.data.frame() %>% 
+  # See 4.Alternative_models.rmd chunk 7 for filters applied here
+  dplyr::filter(gene_peak %in% CRISPRi.validation$gene_peak) %>% 
+  distinct(gene_peak, .keep_all = T)
+
+CRISPRi.validation.all <- CRISPRi.validation %>% 
+  dplyr::filter(celltype == "all") %>% 
+  dplyr::select(gene_peak,ZINB_Zvalue)
+
+PB_CRISPRi <- merge(PB_CRISPRi, CRISPRi.validation.all, by = "gene_peak")
+
+# RegNMF
+RegNMF <- readRDS("../results/RegNMF/RegNMF.scores_pbmc_links_hits.rds")
+Regnmf.cols <- c("CD14 Mono","B_cell","NK")
+RegNMF$gene_peak <- gsub(":","-",RegNMF$gene_peak)
+RegNMF <- RegNMF[,c(Regnmf.cols,"gene_peak")]
+Regnmf.cols <- paste0("RegNMF_score_",Regnmf.cols)
+colnames(RegNMF)[1:3] <- Regnmf.cols
+
+PB_CRISPRi <- merge(PB_CRISPRi, RegNMF, by = "gene_peak", all.x=T)
+```
+
+## ROC CRISPRi pseudobulk
+
+```{r}
+tests <- list(c("zscore","Z-scores"),
+              c("ZINB_Zvalue", "ZINB"), 
+              c("score","Pearson R"),
+              c("Pearson_dist", "Pearson * wDist"),
+              c("dist", "1/Distance"))
+
+PB_CRISPRi$dist <- 1/PB_CRISPRi$link.width
+PB_CRISPRi$Pearson_dist <- PB_CRISPRi$score * (exp(-PB_CRISPRi$link.width/200000))
+
+l.df <- lapply(tests, function(test){
+  
+  PB_CRISPRi.sub <- PB_CRISPRi[!is.na(PB_CRISPRi[[test[1]]]),]
+  
+  pred_ROCR <- prediction(abs(PB_CRISPRi.sub[[test[1]]]), PB_CRISPRi.sub[["Significant"]])
+  roc_ROCR <- performance(pred_ROCR, measure = "tpr", x.measure = "fpr")
+  auc_ROCR <- performance(pred_ROCR, measure = "auc")
+  
+  data.frame(FPR = roc_ROCR@x.values[[1]], 
+             TPR = roc_ROCR@y.values[[1]], 
+             test = test[2],
+             AUC = auc_ROCR@y.values[[1]])
+})
+
+df <- do.call(rbind,l.df)
+
+
+l.df <- lapply(1:3, function(i){
+  
+  PB_CRISPRi.sub <- PB_CRISPRi[!is.na(PB_CRISPRi[[Regnmf.cols[i]]]),]
+  
+  pred_ROCR <- prediction(PB_CRISPRi.sub[[Regnmf.cols[i]]], PB_CRISPRi.sub[["Significant"]])
+  roc_ROCR <- performance(pred_ROCR, measure = "tpr", x.measure = "fpr")
+  auc_ROCR <- performance(pred_ROCR, measure = "auc")
+  
+  data.frame(FPR = roc_ROCR@x.values[[1]], 
+             TPR = roc_ROCR@y.values[[1]], 
+             test = Regnmf.cols[i],
+             AUC = auc_ROCR@y.values[[1]])  
+})
+
+df2 <- do.call(rbind,l.df)
+df <- rbind(df,df2)
+AUCs <- df %>% 
+  group_by(AUC,test) %>% 
+  summarise() %>% 
+  arrange(desc(AUC)) %>% 
+  as.data.frame()
+df$test <- factor(df$test, levels = AUCs$test)
+
+AUCs$AUC <- AUCs$AUC %>% round(3)
+
+AUCs.labs <- c()
+for (i in 1:nrow(AUCs)) {
+  AUCs.labs <- c(AUCs.labs, paste0(AUCs[i,"test"], " = ", AUCs[i,"AUC"]))
+}
+
+AUCs.labs <- gsub("RegNMF_score_","scREG ", AUCs.labs)
+AUCs.labs <- gsub("_"," ", AUCs.labs)
+AUCs.labs <- gsub(" cell","", AUCs.labs)
+AUCs.labs <- gsub(" Mono","", AUCs.labs)
+
+cols <- c("#FF7856","#490092","#00F100","#999999","#FF50FF","#666666","#333333","#3FA0FF")
+names(cols) <- c('Pearson * wDist', '1/Distance', 'Pearson R', 'RegNMF B_cell', 'ZINB', 'RegNMF_score_NK', 'RegNMF_score_CD14 Mono', 'Z-scores')
+
+p <- ggplot(df, aes(FPR ,TPR, colour = test)) +
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  theme(legend.position = c(0.55, 0.3)) + 
+  scale_color_manual(values = cols[AUCs$test], labels = AUCs.labs) + 
+  labs(colour = "AUC") 
+
+ggsave(plot = p, "../figs/5_out/pseudobulk/CRISPRi.png", width = 8, height = 8)
+```
+
+# Fig. S5 - Stat test association with a link's Cell count
+
+```{r}
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+
+matg <- pbmc[["RNA"]]@counts[links0.1$gene,]
+matp <- pbmc[["peaks2"]]@counts[links0.1$peak,]
+matl <- matg * matp
+
+links0.1$non0.cells.per.links <- apply(matl, 1, function(x) length(which(x>0)))
+links0.1 <- merge(links0.1, RegNMF[,c("gene_peak","RegNMF_score_CD14 Mono")], by="gene_peak", all.x=T)
+colnames(links0.1)[grep("CD14 Mono", colnames(links0.1))] <- "CD14.Mono_scREG"
+
+# plot stats associations against non-zero cell counts
+p1 <- ggplot(links0.1, aes(x = abs(zscore), y = non0.cells.per.links)) +
+  geom_point(shape = ".") +
+  scale_y_log10(limits = c(0.5, 11500)) +
+  geom_smooth(color = "darkred", se = F, method = "lm") +
+  ylab("Non-zero link cell count") +
+  xlab("|Z-score|") +
+  ggpubr::stat_cor(label.y = log10(11000)) 
+
+p3 <- ggplot(links0.1, aes(x = ZINB_Zvalue, y = non0.cells.per.links)) +
+  geom_point(shape = ".") +
+  scale_y_log10(limits = c(0.5, 11500)) +
+  xlim(0, 40) + # this removes 1 outlier
+  geom_smooth(color = "darkred", se = F, method = "lm")+
+  ylab("Non-zero link cell count")+
+  xlab("|ZINB Z-value|") +
+  ggpubr::stat_cor(label.y = log10(11000))
+
+p4 <- ggplot(links0.1, aes(x = abs(score), y=non0.cells.per.links)) +
+  geom_point(shape = ".") +
+  geom_smooth(color = "darkred", se = F, method = "lm")+
+  scale_y_log10(limits = c(0.5, 11500)) +
+  ylab("Non-zero link cell count")+
+  xlab("|Pearson R|") +
+  ggpubr::stat_cor(label.y = log10(11000)) +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank())
+
+## add scREG 
+p0 <- ggplot(links0.1, aes(x = CD14.Mono_scREG, y=non0.cells.per.links)) + 
+  geom_point(shape = ".") +
+  geom_smooth(color = "darkred", se = F, method = "lm")+
+  scale_y_log10(limits = c(0.5, 11500)) +
+  xlab(expression(paste(scREG[CD14]," score"))) +
+  ggpubr::stat_cor(label.y = log10(11000)) +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank()) +
+  ylab("Non-zero link cell count")
+
+patch2 <-  (p1 | p4 )/( p3 | p0)
+ggsave(plot = patch2, "../figs/5_out/scatter.non_zero_cell_counts.vs.stats.png", width = 12, height = 12)
+```
+
+```{r}
+sessionInfo()
+```
+

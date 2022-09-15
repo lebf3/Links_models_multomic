@@ -1,0 +1,115 @@
+---
+title: "Downsampling_processing"
+author: "Francis Leblanc"
+date: "21/06/2022"
+output:   
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: true
+    code_folding: hide 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+library(Seurat)
+library(Signac)
+library(tidyverse)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(cowplot)
+
+source("../R/LinkPeaks2.R") # modified from : https://github.com/timoast/signac/blob/master/R/links.R
+# added multicore implementation for windows and the use of logcounts in MatchRegionStats()
+# lines 193 & 233
+
+set.seed(2022)
+theme_set(theme_cowplot())
+```
+
+# Downsampling CD14 Mono, CD16 Mono, cDC2
+
+```{r, eval=FALSE}
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+
+mono.cells <- pbmc@meta.data %>% 
+  dplyr::filter(predicted.id %in% c('CD14 Mono','CD16 Mono','cDC2')) %>% 
+  row.names()
+
+s1 <- sample(mono.cells, length(mono.cells)-500)
+pbmc500 <- subset(pbmc, cells = s1, invert=T)
+
+saveRDS(pbmc500,"../data/pbmc500.mono.rds")
+```
+
+# run on Ubuntu with Macs2 v.2.2.7.1
+
+```{r}
+# peaks <- CallPeaks(pbmc500,
+#                    assay="ATAC", 
+#                    group.by = "predicted.id", 
+#                    macs2.path = "env_macs2/bin/macs2", 
+#                    outdir ="../data/", cleanup = F)
+# saveRDS(peaks,"../data/signac_peaks_500.mono_ct_peaks.rds")
+```
+
+# Downsampled PBMCs processing
+
+```{r}
+pbmc500 <- readRDS("../data/pbmc500.mono.rds")
+peaks <- readRDS("../data/signac_peaks_500.mono.rds")
+
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_hg38_unified, invert = TRUE)
+
+DefaultAssay(pbmc500) <- "ATAC"
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(pbmc500),
+  features = peaks,
+  cells = colnames(pbmc500),
+  process_n = 4000
+)
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+pbmc500[["peaks2"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = pbmc500@assays$ATAC@fragments[[1]]@path,
+  annotation = Annotation(pbmc500@assays$ATAC)
+)
+
+pbmc500 <- NormalizeData(pbmc500, assay = "RNA")
+
+DefaultAssay(pbmc500) <- "peaks2"
+pbmc500 <- RegionStats(pbmc500, genome = BSgenome.Hsapiens.UCSC.hg38)
+```
+
+# Links after downsampling
+
+```{r}
+pbmc500@assays$peaks2@meta.features$counts <- pbmc500@assays$peaks2@counts %>% rowSums()
+pbmc500@assays$peaks2@meta.features$logcount <- log(rowSums(pbmc500@assays$peaks2@counts)+1)
+
+options(future.globals.maxSize=3e9)
+
+pbmc500 <- LinkPeaks2(
+  object = pbmc500,
+  distance = 5e+05,
+  peak.assay = "peaks2",
+  expression.assay = "RNA",
+  pvalue_cutoff = 1,
+  score_cutoff = 0.01,
+  cores_attributed = 4,
+  n_sample = 200
+  )
+
+links.downsampled <- as.data.frame(Links(pbmc500@assays$peaks2)) %>% 
+  mutate(gene_peak = paste0(gene,"_",peak))
+saveRDS(links.downsampled, "../results/pbmc500_links_r0.01.rds")
+```
+

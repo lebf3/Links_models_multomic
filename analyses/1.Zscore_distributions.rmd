@@ -1,0 +1,383 @@
+---
+title: "1.Zscore_distributions"
+author: "Francis Leblanc"
+date: "21/06/2022"
+output:   
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: true
+    code_folding: hide 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+library(Seurat)
+library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(Nebulosa)
+source("../R/LinkPeaks2.R") # modified from : https://github.com/timoast/signac/blob/master/R/links.R
+# added multicore implementation for windows and the use of logcounts in MatchRegionStats()
+# lines 193 & 233
+
+
+# transparent background
+theme_set(theme_cowplot())
+
+trs_theme <- theme(
+    panel.background = element_rect(fill = "transparent",colour = NA),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    plot.background = element_rect(fill = "transparent",colour = NA),
+    legend.background  = element_rect(fill = "transparent",colour = NA),
+    legend.key = element_rect(fill = "transparent",colour = NA))
+
+p_umap <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + xlab("UMAP1") + ylab("UMAP2") + 
+  theme_classic() + 
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  trs_theme
+
+set.seed(2022)
+```
+
+
+# Compute links statistics with R > 0.01
+~ 4h
+
+```{r eval=FALSE}
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+DefaultAssay(pbmc) <- "peaks2"
+
+# compute peaks stats
+pbmc <- RegionStats(pbmc, genome = BSgenome.Hsapiens.UCSC.hg38)
+
+# compute log of ATACseq peaks counts for better matching
+pbmc@assays$peaks2@meta.features$logcount <- log(rowSums(pbmc@assays$peaks2@counts)+1)
+
+options(future.globals.maxSize=3e9)
+
+pbmc <- LinkPeaks2(
+  object = pbmc,
+  distance = 5e+05,
+  peak.assay = "peaks2",
+  expression.assay = "RNA",
+  pvalue_cutoff = 1,
+  score_cutoff = 0.01,
+  cores_attributed = 4,
+  n_sample = 200
+  )
+
+links0.01 <- Links(pbmc@assays$peaks2)
+saveRDS(links0.01,"../results/Granges_links_signac_200null.r0.01.rds")
+```
+
+# Fig. S1 - UMAPs
+## ATAC
+
+```{r}
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+DefaultAssay(pbmc) <- "peaks2"
+
+pbmc <- RunUMAP(pbmc, 
+                dims = 2:30, 
+                reduction = "lsi", 
+                reduction.name = 'umap.peaks2', 
+                reduction.key = 'peaks2.UMAP_', 
+                assay = "peaks2")
+
+p <- DimPlot(pbmc, 
+             reduction = "umap.peaks2", 
+             group.by = "predicted.id", 
+             label = T, 
+             repel = T) + 
+  xlab("UMAP1") + 
+  ylab("UMAP2") +
+  trs_theme + 
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.line = element_line(arrow = arrow(angle = 15, 
+                                               length = unit(.15,"inches"), 
+                                               type = "closed")))+
+  ggtitle("") & 
+  NoLegend() 
+
+ggsave(plot = p,"../figs/1_out/umap_lsi2-30.png", width = 8, height = 8, dpi = 300)
+```
+
+## RNA
+
+```{r}
+DefaultAssay(pbmc) <- "SCT"
+pbmc <- RunUMAP(pbmc, 
+                dims = 1:30, 
+                reduction = "pca", 
+                reduction.name = 'umap.sct', 
+                reduction.key = 'sct.UMAP_', 
+                assay = "SCT")
+
+p <- DimPlot(pbmc, 
+             reduction = "umap.sct", 
+             group.by = "predicted.id", 
+             label = T, 
+             repel = T) + 
+  xlab("UMAP1") + 
+  ylab("UMAP2") +
+  trs_theme + 
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.line = element_line(arrow = arrow(angle = 15, 
+                                               length = unit(.15,"inches"), 
+                                               type = "closed")))+
+  ggtitle("") & 
+  NoLegend() 
+
+ggsave(plot = p,"../figs/1_out/umap_SCT1-30.png", width = 8, height = 8, dpi = 300)
+```
+
+# Attribute links to celltypes
+
+Here we aim to assess the power to detect links across celltypes.
+Links are attributed to a celltype using specificity of accessibility of the ATACseq peak.
+This is done with the AUC statistic from presto.
+https://github.com/immunogenomics/presto 
+
+```{r}
+links0.01 <- readRDS("../results/Granges_links_signac_200null.r0.01.rds")
+links0.01 <- links0.01 %>% 
+  as.data.frame() %>% 
+  mutate(gene_peak = paste0(gene,"_",peak))
+
+
+# get AUC for each peak
+markers_peaks <- presto:::wilcoxauc.Seurat(X = pbmc, 
+                                           group_by = 'predicted.id', 
+                                           assay = 'data', 
+                                           seurat_assay = 'peaks2')
+
+# keep only celltypes with 50 > cells
+# lowly represented celltypes creates unreliable AUCs
+ct.count <- pbmc$predicted.id %>% table %>% sort()
+saveRDS(ct.count, "../data/ct.count.rds")
+top.ct <- names(ct.count[ct.count > 50])
+
+
+markers_peaks.f <- markers_peaks %>% 
+  dplyr::filter(feature %in% links0.01$peak & 
+                  # Peaks assigned to a celltype with low confidence will be Not specific
+                  padj < 0.00001 & 
+                  auc > 0.55 & 
+                  group %in% top.ct) %>%
+  # keep the celltype with the best AUC
+  arrange(desc(auc)) %>% 
+  distinct(feature, .keep_all = T) 
+
+
+links0.01$ct_top_auc <- markers_peaks.f$group[match(
+  links0.01$peak, 
+  markers_peaks.f$feature)]
+
+links0.01$ct_top_auc[is.na(links0.01$ct_top_auc)] <- "not.specific"
+groups.names <- c(top.ct, "not.specific")
+```
+
+
+# Fig. S2 - qq plots 
+
+```{r}
+# based on specificity of the cCRE in each celltype
+# compute the expected p-values and compare to expected
+l <-lapply(groups.names, function(x){
+  df.ct <- links0.01 %>% 
+    dplyr::filter(ct_top_auc == x)
+  
+  Expected <- -log10(sort(runif(n = nrow(df.ct))))
+  Link_log10P <- sort(-log10(df.ct$pvalue), decreasing = T) 
+  
+  df.ct <- data.frame(Expected = Expected,
+                      Link_log10P = Link_log10P)
+  
+  ggscatter(df.ct, x = "Expected", y = "Link_log10P", 
+            alpha = 0.5, 
+            xlab = "-Log10(P) expected",
+            ylab = "-Log10(P) observed") +
+    geom_abline(intercept = 0, slope = 1, alpha = 0.5) +
+    ggtitle(paste0(x)) + 
+    ylim(0, 1 + max(-log10(links0.01$pvalue))) +
+    xlim(0, 6.5) + 
+    annotate("text", 
+             label = paste0("n cells = ", 
+                            ct.count[x], 
+                            "\nmax = ", 
+                            round(max(df.ct$Link_log10P))),
+             x = 1, y = 90)+ 
+    trs_theme
+  
+})
+
+p <- cowplot::plot_grid(plotlist = l, ncol = 3)
+ggsave(plot = p, "../figs/1_out/p_val_links_qqplots_celltypes.r0.01.png", width = 12, height = 20)
+```
+
+# Fig. 1 - NOD2 locus plot
+
+```{r}
+gr.links0.01 <- readRDS("../results/Granges_links_signac_200null.r0.01.rds")
+gr.links0.01 <- gr.links0.01[gr.links0.01$pvalue < 0.05]
+
+# Keep top celltypes for clarity - locus plot 
+pbmc.major.ct <- subset(pbmc, subset = predicted.id %in% top.ct)
+Links(pbmc.major.ct@assays$peaks2) <- gr.links0.01
+
+# top NOD2 links
+nod2 <- links0.01 %>% dplyr::filter(gene=="NOD2" &
+                                      width < 30000 & 
+                                      abs(score) > 0.075) %>% 
+  arrange(desc(score))
+
+# top 3 cCREs for NOD2
+region.highlight <- StringToGRanges(nod2$peak[1:3])
+region.highlight$color <- c("darkred","black","black") # darkred = rs9302752 NOD2 eQTL
+
+
+p1 <- CoveragePlot(pbmc.major.ct, 
+             region = "NOD2",
+             region.highlight = region.highlight,
+             features = "NOD2",
+             assay = 'peaks2',
+             expression.assay = "RNA",
+             peaks = T,
+             group.by="predicted.id",
+             extend.upstream = 25000,
+             extend.downstream = 0,
+             window = 250)
+
+# dimplot to show celltypes
+p2 <- DimPlot(pbmc, 
+              reduction = "umap.sct", 
+              label =T, 
+              group.by = "predicted.id", 
+              repel = T) & 
+  NoLegend() & 
+  ggtitle("") & 
+  NoAxes()
+
+#  density plots to show signal colocalization
+DefaultAssay(pbmc) <- "RNA"
+
+p3 <- plot_density(pbmc, "NOD2") & NoAxes() & ggtitle(expression(italic("NOD2")))
+p4 <- plot_density(pbmc, "SNX20") & NoAxes() & ggtitle(expression(italic("SNX20")))
+
+DefaultAssay(pbmc) <- "peaks2"
+p5 <- plot_density(pbmc, "chr16-50684843-50685984") & 
+  NoAxes() & 
+  ggtitle("chr16-50684843-50685984 (Peak #1)")
+p5 <- p5 + inset_element(p_umap, left = -0.01, bottom = -0.01, right = 0.18, top = 0.25)
+
+
+layout <- "
+  AAAB
+  AAAC
+  AAAD
+  AAAE
+  "
+
+p <- wrap_plots(A = p1, B = p2, C = p4, D = p3, E = p5, design = layout)
+
+ggsave(plot = p, "../figs/1_out/coverage_plot_NOD2.png", height = 15, width = 20)
+```
+
+
+# Fig. S6 - GC content effect on Z-scores
+```{r}
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+DefaultAssay(pbmc) <- "peaks2"
+
+# compute peaks stats
+pbmc <- RegionStats(pbmc, genome = BSgenome.Hsapiens.UCSC.hg38)
+
+# compute log of ATACseq peaks counts for better matching
+pbmc@assays$peaks2@meta.features$logcount <- log(rowSums(pbmc@assays$peaks2@counts)+1)
+########## test
+gr.links0.01 <- readRDS("../results/Granges_links_signac_200null.r0.01.rds")
+gr.links0.01 <- gr.links0.01[abs(gr.links0.01$score) > 0.1]
+##########
+set.seed(1)
+pbmc <- LinkPeaks2(
+  object = pbmc,
+  distance = 5e+05,
+  peak.assay = "peaks2",
+  expression.assay = "RNA",
+  pvalue_cutoff = 1,
+  score_cutoff = 0.1,
+  cores_attributed = 1, # multiprocess doesn't keep seed
+  n_sample = 200,
+  MatchRegionStats.features = c("GC.percent","logcount")
+  )
+
+links.run1 <- Links(pbmc@assays$peaks2)
+saveRDS(links.run1, "../results/Granges_links_test.Run1_200null.r0.1.rds")
+
+
+set.seed(2)
+pbmc <- LinkPeaks2(
+  object = pbmc,
+  distance = 5e+05,
+  peak.assay = "peaks2",
+  expression.assay = "RNA",
+  pvalue_cutoff = 1,
+  score_cutoff = 0.1,
+  cores_attributed = 1, 
+  n_sample = 200,
+  MatchRegionStats.features = c("GC.percent","logcount")
+  )
+
+links.run2 <- Links(pbmc@assays$peaks2)
+saveRDS(links.run2, "../results/Granges_links_test.Run2_200null.r0.1.rds")
+
+p1 <- data.frame(Run1 = links.run1$zscore,
+                 Run2 = links.run2$zscore) %>% 
+  ggscatter(x="Run2", y="Run1",  alpha = 0.2, size = 1,
+            xlab = "Z-scores run 2", ylab = "Z-scores run 1",
+            cor.coef=T) 
+
+
+set.seed(1)
+pbmc <- LinkPeaks2(
+  object = pbmc,
+  distance = 5e+05,
+  peak.assay = "peaks2",
+  expression.assay = "RNA",
+  pvalue_cutoff = 1,
+  score_cutoff = 0.1,
+  cores_attributed = 1, 
+  n_sample = 200,
+  MatchRegionStats.features = c("logcount")
+)
+
+links.noGC <- Links(pbmc@assays$peaks2)
+saveRDS(links.noGC, "../results/Granges_links_test.noGC_200null.r0.1.rds")
+
+
+p2 <- data.frame(Run1 = links.run1$zscore,
+                 noGC = links.noGC$zscore) %>% 
+  ggscatter(x="noGC", y="Run1",  alpha = 0.2, size = 1,
+            xlab = "Z scores count corrected", 
+            ylab = "Z scores GC and count corrected",
+            cor.coef=T) 
+
+ggsave(plot = p1 | p2, "../figs/1_out/scatter_zscores_GC.effet.png", width = 10, height = 5)
+```
+
+```{r}
+sessionInfo()
+```
+

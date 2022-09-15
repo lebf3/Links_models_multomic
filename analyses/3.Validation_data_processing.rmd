@@ -1,0 +1,135 @@
+---
+title: "Validation_data_processing"
+date: "23/06/2022"
+output:   
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: true
+    code_folding: hide 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+library(Seurat)
+library(Signac)
+library(tidyverse)
+library(AnnotationHub)
+
+source("../R/Epimap_to_Grange.R")
+# Download and select Epimap links present in all replicates for this celltype
+```
+
+
+Get Epimap meta data here:
+https://personal.broadinstitute.org/cboix/epimap/metadata/Imputation_Metadata.xlsx
+
+# Gather CD14, B Cells and NK Epimap links predictions 
+```{r}
+epi.meta <- rio::import("../data/Epimap/Imputation_Metadata.xlsx")
+# CD14
+CD14_epimap.gr <- Epimap_to_Grange(epimap_celltype = "CD14 MONOCYTE", epi.meta = epi.meta)
+saveRDS(CD14_epimap.gr,"../data/Epimap/CD14_epimap.gr.rds")
+# B
+B_epimap.gr <- Epimap_to_Grange(epimap_celltype = "B CELL", epi.meta = epi.meta)
+saveRDS(B_epimap.gr,"../data/Epimap/B_epimap.gr.rds")
+# NK
+NK_epimap.gr <- Epimap_to_Grange(epimap_celltype = "NK CELL", epi.meta = epi.meta)
+saveRDS(NK_epimap.gr,"../data/Epimap/NK_epimap.gr.rds")
+```
+
+
+## Assign Epimap links predictions with PBMC links as ground truth
+
+```{r}
+peaks <- readRDS("../data/signac_peaks.rds")
+peaks$peak <- GRangesToString(peaks)
+
+links0.01 <- readRDS("../results/Granges_links_signac_200null.r0.01.rds")
+links0.01$gene_peak <- paste0(links0.01$gene,"_",links0.01$peak)
+
+# change ranges from links to peaks 
+# (the links Grange object has start and end matching the peak and the gene tss)
+# here we need start end to match the peak boundaries
+peak.gr.links0.01 <- StringToGRanges(links0.01$peak)
+peak.gr.links0.01@elementMetadata <- links0.01@elementMetadata
+peak.gr.links0.01$peak_called_in <- peaks$peak_called_in[match(
+  peak.gr.links0.01$peak, peaks$peak
+)]
+
+# label peaks overlaping with Epimap predicted cCREs
+epimap.path <- "../data/Epimap/"
+for (i in c("CD14_epimap","B_epimap","NK_epimap")) {
+  epimap.gr <- readRDS(paste0(epimap.path, i, ".gr.rds"))
+  
+  ovelaping_peaks <- findOverlaps(peak.gr.links0.01, epimap.gr)
+  
+  # keep overlapping peaks linked to the same gene
+  same.gene.peak <- which(
+    peak.gr.links0.01$gene[ovelaping_peaks@from] == 
+      epimap.gr$gene_name[ovelaping_peaks@to]
+  )
+  epimap.positive.links <- ovelaping_peaks[same.gene.peak]@from %>% 
+    unique()
+  
+  peak.gr.links0.01@elementMetadata[[i]] <- ifelse(
+    peak.gr.links0.01$gene_peak %in% 
+      peak.gr.links0.01[epimap.positive.links]$gene_peak, 
+    TRUE, 
+    FALSE
+  )
+}
+
+# reassign widths as distance between tss and peak
+peak.gr.links0.01$link.width <- BiocGenerics::width(links0.01[match(
+  peak.gr.links0.01$gene_peak,
+  links0.01$gene_peak
+)])
+
+peak.links0.01.df <- peak.gr.links0.01 %>% as.data.frame()
+saveRDS(peak.links0.01.df, "../results/links0.01_Epimap.labeled.rds")
+```
+
+# CRISPR valiadation ABC Allcells 
+tableS5 from : PMID: 33828297
+https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-021-03446-x/MediaObjects/41586_2021_3446_MOESM7_ESM.txt
+
+```{r}
+ABC_all <- rio::import("../data/ABC_CRISPRi/ABC_2021_tableS5.txt")
+colnames(ABC_all)[1:3] <- c("chr","start","end")
+
+gr <- makeGRangesFromDataFrame(ABC_all, keep.extra.columns = TRUE)
+
+#### lisftover to hg38
+ahub <- AnnotationHub()
+ahub.chain <- subset(ahub, rdataclass == "ChainFile" & species == "Homo sapiens")
+query(ahub.chain, c("hg38", "hg19"))
+chain <- ahub.chain[ahub.chain$title == "hg19ToHg38.over.chain.gz"]
+chain <- chain[[1]]
+gr.hg38 <- liftOver(gr, chain)
+gr.hg38 <- unlist(gr.hg38)
+
+# Label CRISPR validations that overlaps with links tested (Pearson R > 0.01)
+ol <- findOverlaps(gr.hg38, peak.gr.links0.01) %>% as.data.frame()
+
+gr.hg38$is_snATAC_peak <- F
+gr.hg38$is_snATAC_peak[ol$queryHits] <- T
+
+links0.01_CRISPR <- cbind(gr.hg38@elementMetadata[ol$queryHits,],
+                          peak.gr.links0.01@elementMetadata[ol$subjectHits,])
+
+# overlapping peaks with same gene
+keep <- which(links0.01_CRISPR$GeneSymbol == links0.01_CRISPR$gene)
+links0.01_CRISPR <- links0.01_CRISPR[keep,]
+
+saveRDS(links0.01_CRISPR, "../results/links0.01_CRISPR_overlap.rds")
+```
+
+
+
+

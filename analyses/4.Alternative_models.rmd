@@ -1,0 +1,585 @@
+---
+title: "4.Alternative_models"
+author: "Francis Leblanc"
+date: "23/06/2022"
+output:   
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: true
+    code_folding: hide 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+library(Seurat)
+library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(tidyverse)
+
+source("../R/LinkPeaks2.R") # modified from : https://github.com/timoast/signac/blob/master/R/links.R
+# added multicore implementation for windows and the use of logcounts in MatchRegionStats()
+# lines 193 & 233
+source("../R/Linkpeaks.preset.pairs.R")
+
+set.seed(2022)
+```
+
+
+# Pseudobulk ZINB links (all |Preason R| > 0.1)
+Here we compute Zero-inflated negative-binomial (ZINB) associations for a cCRE and its gene
+Since this is computationally expensive we run it on links that have a |Pearson R| > 0.1
+
+```{r}
+links0.1.df <- readRDS("../results/links0.01_Epimap.labeled.rds") %>% 
+  dplyr::filter(abs(score) > 0.1) 
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+
+# cellular detection rate as covariate
+cdr.peaks  <- scale(
+  colSums(pbmc[["peaks2"]]@counts != 0) / nrow(pbmc[["peaks2"]]@counts)
+)
+
+cdr.genes <- scale(
+  colSums(pbmc[["RNA"]]@counts != 0) / nrow(pbmc[["RNA"]]@counts)
+)
+  
+# only keep necessary data to reduce memory costs with multiprocess
+genes <- links0.1.df$gene %>% unique()
+gene_mat <- pbmc[["RNA"]]@counts[genes, ] # counts necessary for zeroinfl
+peaks <- links0.1.df$peak %>% unique()
+peak_mat <- pbmc[["peaks2"]]@counts[peaks, ] # counts necessary for zeroinfl
+
+# remove pbmc for multiprocess memory
+rm(pbmc)
+
+options(future.globals.maxSize=1e9)
+plan(multiprocess, workers = 6)
+
+tictoc::tic()
+ZINB.stats.l <- future.apply::future_lapply(1:nrow(links0.1.df), function(x){
+
+  my_gene <- links0.1.df[x, "gene"]
+  my_peak <- links0.1.df[x, "peak"]
+  
+  # count data
+  gene_counts <- gene_mat[my_gene, ] 
+  peak_counts <- peak_mat[my_peak, ]
+  
+  # If there are no cells with 0 counts, use glm.nb
+  if(min(gene_counts) > 0){
+    S <- MASS::glm.nb(gene_counts ~ peak_counts + cdr.peaks + cdr.genes) %>% 
+      summary() 
+    coef <- S$coefficients[2, ]
+  }
+  else{
+    # ZINB model
+    S <- pscl::zeroinfl(gene_counts ~ 
+                          peak_counts + cdr.peaks + cdr.genes | 
+                          cdr.peaks + cdr.genes, 
+                        dist = 'negbin') %>% 
+      summary() 
+    coef <- S$coefficients$count[2, ]
+  }
+  coef
+  
+})
+tictoc::toc() # 3875.64 sec elapsed
+
+ZINB.stats <- do.call("rbind", ZINB.stats.l)
+colnames(ZINB.stats) <- c("ZINB_Estimate","ZINB_Std.Error","ZINB_Zvalue","ZINB_P")
+ZINB.stats <- as.data.frame(ZINB.stats)
+ZINB.stats$ZINB_log10P <- -log10(ZINB.stats$ZINB_P)
+links0.1.df <- cbind(links0.1.df,ZINB.stats)
+links0.1.df <- links0.1.df %>% dplyr::select(-c(seqnames:strand))
+
+saveRDS(links0.1.df, "../results/links0.1_epimap.labels_ZINB.rds")
+```
+
+# Links calling on PBMC subsets (all |Preason R| > 0.1)
+## Zscores
+```{r}
+# set.seed(2022) # to re-run with seed
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+Idents(pbmc) <- "predicted.id"
+
+ct <- list(c("CD14 Mono"),
+           c("B intermediate", "B memory", "B naive"),
+           c("NK", "NK Proliferating", "NK_CD56bright"))
+names(ct) <- c("CD14", "B", "NK")
+
+for (i in names(ct)) {
+  
+  sub.ct <- subset(pbmc, idents = ct[[i]])
+
+  DefaultAssay(sub.ct) <- "peaks2"
+  
+  # compute peaks stats
+  sub.ct <- RegionStats(sub.ct, genome = BSgenome.Hsapiens.UCSC.hg38)
+  
+  # compute log of ATACseq peaks counts for better matching
+  sub.ct@assays$peaks2@meta.features$logcount <- log(rowSums(sub.ct@assays$peaks2@counts)+1)
+  
+  options(future.globals.maxSize=3e9)
+  
+  sub.ct <- LinkPeaks2(
+    object = sub.ct,
+    distance = 5e+05,
+    peak.assay = "peaks2",
+    expression.assay = "RNA",
+    pvalue_cutoff = 1,
+    score_cutoff = 0.1,
+    cores_attributed = 4,
+    n_sample = 200
+  )
+
+  if (i ==  names(ct)[1]) {
+    ct.links <- Links(sub.ct) %>% as.data.frame()
+    ct.links$celltype <- i
+  }
+  else{
+    df <- Links(sub.ct) %>% as.data.frame()
+    df$celltype <- i
+    ct.links <- rbind(ct.links, df)
+  }
+}
+ct.links$gene_peak <- paste0(ct.links$gene, "_", ct.links$peak)
+saveRDS(ct.links,"../results/celltype_subsetted.links0.1.rds")
+```
+
+
+## ZINB
+
+```{r}
+ct.links0.1 <- ct.links %>% dplyr::filter(abs(score) > 0.1)
+
+l <- list()
+for (i in names(ct)) {
+  
+  pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+  Idents(pbmc) <- "predicted.id"
+  
+  sub.ct <- subset(pbmc, idents = ct[[i]])
+  rm(pbmc)
+  
+  # cellular detection rate as covariate
+  cdr.peaks  <- scale(
+    colSums(sub.ct[["peaks2"]]@counts != 0) / nrow(sub.ct[["peaks2"]]@counts)
+  )
+  
+  cdr.genes <- scale(
+    colSums(sub.ct[["RNA"]]@counts != 0) / nrow(sub.ct[["RNA"]]@counts)
+  )
+  
+  ct.links0.1_sub <- ct.links0.1 %>% dplyr::filter(celltype == i)
+  
+  # only keep necessary data to reduce memory costs with multiprocess
+  genes <- ct.links0.1_sub$gene %>% unique()
+  gene_mat <- sub.ct[["RNA"]]@counts[genes, ] # counts necessary for zeroinfl
+  peaks <- ct.links0.1_sub$peak %>% unique()
+  peak_mat <- sub.ct[["peaks2"]]@counts[peaks, ] # counts necessary for zeroinfl
+  
+  ################################ 
+  
+  options(future.globals.maxSize=1e9)
+  plan(multiprocess, workers = 6)
+  
+  tictoc::tic()
+  ZINB.stats.l <- future.apply::future_lapply(1:nrow(ct.links0.1_sub), function(x){
+
+    my_gene <- ct.links0.1_sub[x,"gene"]
+    my_peak <- ct.links0.1_sub[x,"peak"]
+    
+    # count data
+    gene_counts <- gene_mat[my_gene, ] 
+    peak_counts <- peak_mat[my_peak,]
+    
+    # If there are no cells with 0 counts, use glm.nb
+    if(min(gene_counts) > 0){
+      S <- MASS::glm.nb(gene_counts ~ peak_counts + cdr.peaks + cdr.genes) %>% 
+        summary() 
+      coef <- S$coefficients[2,]
+    }
+    else{
+      # ZINB model
+      S <- pscl::zeroinfl(gene_counts ~ 
+                            peak_counts + cdr.peaks + cdr.genes | 
+                            cdr.peaks + cdr.genes, 
+                          dist = 'negbin') %>% 
+        summary() 
+      coef <- S$coefficients$count[2,]
+    }
+    c(coef, paste0(my_gene, "_", my_peak))
+    
+  })
+  tictoc::toc() 
+  
+  ZINB.stats <- do.call("rbind", ZINB.stats.l)
+  colnames(ZINB.stats) <- c("ZINB_Estimate","ZINB_Std.Error","ZINB_Zvalue","ZINB_P", "gene_peak")
+  ZINB.stats <- as.data.frame(ZINB.stats)
+  ZINB.stats[,1:4] <- apply(ZINB.stats[,1:4],2,as.numeric)
+  ct.links0.1_sub <- merge(ct.links0.1_sub, ZINB.stats, by="gene_peak", all=T)
+  l[[i]] <- ct.links0.1_sub
+
+}
+ct.links0.1 <- do.call(rbind,l)
+saveRDS(ct.links0.1, "../results/celltype_subsetted.links0.1_ZINB.rds")
+```
+
+
+
+## RegNMF
+
+```{r}
+#### Debugging: retrieve the full table of links results
+## SplitGroup fun :
+## https://github.com/Durenlab/RegNMF/blob/3a2efd190c73a78d920b42baf8a4e7074e582b64/R/SplitGroup.default.R
+
+SplitGroup_all_links <- function(
+  barcord = element$barcode[,1],
+  W3 = W123H$W3,
+  H = W123H$H,
+  Reg_symbol_name = W123H$Reg_gene_name,
+  Reg_peak_name = W123H$Reg_peak_name,
+  cluster = ans$S[1,]
+) {
+
+  clustern = length(unique(cluster))
+  barcord_cluster = data.frame(barcord = barcord, cluster = cluster)
+  
+  chr=c()
+  peaks=c()
+  peake=c()
+  
+  for (i in 1:length(Reg_peak_name)) {
+    a = strsplit(Reg_peak_name[i],':')
+    b = strsplit(a[[1]][2],'-')
+    chr[i] = a[[1]][1]
+    peaks[i] = b[[1]][1]
+    peake[i] = b[[1]][2]
+  }
+  
+  df=data.frame(chr=chr,peaks=peaks,peake=peake,symbolName=Reg_symbol_name)
+  
+  H_norm=H/sqrt(rowSums(H*H))
+  W3_norm=t(t(W3)*sqrt(rowSums(H*H)))
+  H_w=matrix(nrow = nrow(H_norm),ncol = clustern)
+  cluster.names <- cluster %>% unique()
+  
+  for (i in 1:clustern) {
+    H_w[,i]=rowMeans(H_norm[,cluster==cluster.names[i]])
+  }
+  
+  W3_cluster <- W3_norm%*%H_w %>% as.data.frame()
+  colnames(W3_cluster) <- cluster.names
+  W3_cluster
+}
+```
+
+### Tutorial implementation
+https://github.com/Durenlab/RegNMF
+
+The code implemented bellow (exact code from the tutorial) returns a list of links (10,000 per identified clusters) with very low overlap with Epimap links # (to quantify)
+We found 2 probable causes for this described in this github issue (https://github.com/Durenlab/RegNMF/issues/3)
+  
+  * First, the output from SplitGroup() are the 10000 RE-TG pairs with lowest CRS values for that cell type, but the publication on this algorithm mentions "higher CRS in a subpopulation indicates a potential cis-regulation"
+
+https://github.com/Durenlab/RegNMF/blob/3a2efd190c73a78d920b42baf8a4e7074e582b64/R/SplitGroup.default.R#L39
+
+  * Second, the ATACseq data is log10 transformed while the RNAseq data is log2 transformed. This creates a stronger weights for the gene expression component of the links matrix and skews results towards highly expressed genes (i.e. links with MALAT1 were the top 20 links for all clusters). The publication on this algorithm mentions that both ATAC and RNA data are Log2 transformed. 
+  
+https://github.com/Durenlab/RegNMF/blob/3a2efd190c73a78d920b42baf8a4e7074e582b64/R/read_ATAC_GEX.default.R#L56
+
+```{r eval=FALSE, include=TRUE}
+# not run
+library(RegNMF)
+in_foldername = "filtered_feature_bc_matrix/"
+element = read_ATAC_GEX(in_foldername)
+
+W123H=RegNMF(E=element$E, O=element$O, Symbol=element$Symbol, PeakName=element$PeakName, Symbol_location=element$Symbol_location, Peak_location=element$Peak_location, core = 1)
+
+ans=clustering(W123H$H)
+
+out_foldername = "../results/RegNMF/"
+groupName=SplitGroup(foldername=out_foldername,
+                     barcord=element$barcode[,1],
+                     W3=W123H$W3,
+                     H=W123H$H,
+                     Reg_symbol_name=W123H$Reg_gene_name,
+                     Reg_peak_name=W123H$Reg_peak_name,
+                     cluster=ans$S[1,])
+
+
+W3_cluster <- SplitGroup_all_links(
+  barcord = element$barcode[,1],
+  W3 = W123H$W3,
+  H = W123H$H,
+  Reg_symbol_name = W123H$Reg_gene_name,
+  Reg_peak_name = W123H$Reg_peak_name,
+  cluster = ans$S[1,]
+)
+
+W3_cluster$Peak_gene <- apply(df, 1, function(x) paste(x,collapse = "_"))
+colnames(W3_cluster) <- c(1:13,"Peak_gene")
+# saveRDS(W3_cluster, "../results/RegNMF/full_W3_cluster.rds")
+# W3_cluster <- readRDS("../results/RegNMF/full_W3_cluster.rds")
+
+Peak_gene <- limma::strsplit2(W3_cluster$Peak_gene,"_") %>% as.data.frame()
+Peak_gene$peak <- paste0(Peak_gene[,1], "-", Peak_gene[,2], "-", Peak_gene[,3])
+W3_cluster$gene_peak <- paste0(Peak_gene[,4], "_", Peak_gene$peak)
+```
+
+### Implementation with Genes and Peaks in Links with Pearson R > 0.1
+To have results comparable to what is generated above, we used as input the genes and peaks for which we have tested all other models against either Epimap or CRISPR validations
+
+```{r}
+library(RegNMF)
+peak.links0.1.Epimap.labeled <- readRDS("../results/links0.01_Epimap.labeled.rds") %>% 
+  dplyr::filter(abs(score) > 0.1)
+peak.links0.01_CRISPR_overlap <- readRDS("../results/links0.01_CRISPR_overlap.rds")
+
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+tss.pos <- GetTSSPositions(Annotation(object = pbmc@assays$peaks2), biotypes = NULL)
+
+# genes to keep
+genes_validate <- unique(c(peak.links0.1.Epimap.labeled$gene,
+                           peak.links0.01_CRISPR_overlap$gene))
+
+E = as.sparse(log2(1+pbmc@assays$RNA@counts[genes_validate,]))
+row.names(E) <- NULL
+colnames(E) <- NULL
+
+# peaks to keep
+peaks_validate <- unique(c(peak.links0.1.Epimap.labeled$peak, 
+                           peak.links0.01_CRISPR_overlap$peak))
+
+O = as.sparse(log2(1+pbmc@assays$peaks2@counts[peaks_validate,]))
+row.names(O) <- NULL
+colnames(O) <- NULL
+
+# format peaks strings for RegNMF
+peaks.names <- limma::strsplit2(peaks_validate,"-")
+peaks.names2 <- apply(peaks.names, 1, function(x) paste0(x[1],":",x[2],"-",x[3]))
+
+seqn.peaks <- peaks.names[,1] %>% str_remove("chr")
+seqn.peaks[seqn.peaks == "X"] <- "23"
+seqn.peaks <- as.numeric(seqn.peaks)
+
+# format genes positions for RegNMF
+gene.pos <- tss.pos@ranges@start[match(genes_validate, tss.pos$gene_name)]
+seqn.gene <- tss.pos@seqnames[match(genes_validate, tss.pos$gene_name)] %>% 
+  as.character() %>% 
+  str_remove("chr")
+seqn.gene[seqn.gene == "X"] <- "23"
+seqn.gene <- as.numeric(seqn.gene)
+
+# genes coordinates
+Symbol_location = cbind(seqn.gene, gene.pos)
+colnames(Symbol_location) <- NULL
+
+# peaks coordinates
+Peak_location=cbind(seqn.peaks, as.numeric(peaks.names[,2]))
+colnames(Peak_location) <- NULL
+
+# Run RegNMF
+# set.seed(2022)
+W123H_2=RegNMF(E=E,
+               O=O, 
+               Symbol=genes_validate,
+               PeakName=peaks.names2,
+               Symbol_location=Symbol_location, 
+               Peak_location=Peak_location,
+               core = 1)
+# saveRDS(W123H_2,"../results/RegNMF/W123H_2_pbmc_links_hits.rds")
+# W123H_2 <- readRDS("../results/RegNMF/W123H_2_pbmc_links_hits.rds")
+
+# get links scores by predicted id matching groups for Epimap; CD14, B, NK, others
+pred.id <- pbmc$predicted.id
+pred.id <- gsub("B intermediate|B memory|B naive", "B_cell", x = pred.id)
+pred.id <- gsub("NK Proliferating|NK_CD56bright", "NK", x = pred.id)
+
+ct.count <- pred.id %>% table %>% sort()
+top.ct <- names(ct.count[ct.count > 50])
+pred.id <- ifelse(pred.id %in% top.ct, pred.id, "other")
+
+RegNMF_links <- SplitGroup_all_links(
+  barcord = colnames(pbmc),
+  W3 = W123H_2$W3,
+  H = W123H_2$H,
+  Reg_symbol_name = W123H_2$Reg_gene_name,
+  Reg_peak_name = W123H_2$Reg_peak_name,
+  cluster = pred.id
+)
+peaks <- gsub(x=W123H_2$Reg_peak_name,":","-")
+peaks <- gsub(x=W123H_2$Reg_peak_name,"chr23","chrX")
+
+RegNMF_links$gene_peak <- paste0(W123H_2$Reg_gene_name,
+                                 "_",
+                                 peaks)
+saveRDS(RegNMF_links,"../results/RegNMF/RegNMF.scores_pbmc_links_hits.rds")
+```
+
+# CRISPR validation statistics for subsetted CD14, B & NK 
+## Remove links with discordant CRISPRi results accross cell lines
+
+```{r}
+PBMC_links0.01_CRISPR_overlap <- readRDS("../results/links0.01_CRISPR_overlap.rds") %>% 
+  as.data.frame()
+CRISPR.validation <- PBMC_links0.01_CRISPR_overlap %>% 
+  dplyr::filter(IncludeInModel == T) # ABC filter
+
+dup.test <- CRISPR.validation %>% 
+  group_by(gene_peak) %>% 
+  filter(n()>1) 
+
+dup.tab <- table(dup.test$gene_peak, dup.test$Significant)
+
+# remove links that were significant in a celltype but not in an other
+discordant.significance <- apply(dup.tab,1, function(x){!any(x==0)})
+discordant.significance <- row.names(dup.tab[discordant.significance,])
+
+CRISPR.validation <- CRISPR.validation %>% 
+  filter(!gene_peak %in% discordant.significance)
+
+CRISPR.validation <- CRISPR.validation %>% distinct(gene_peak, .keep_all = T)
+```
+
+## Compute Pearson R, Zscores and ZINB statistics
+
+```{r}
+source("../R/Linkpeaks.preset.pairs.R")
+# set.seed(2022)
+
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+Idents(pbmc) <- "predicted.id"
+
+ct <- list("all",
+           "CD14 Mono",
+           c("B intermediate", "B memory", "B naive"),
+           c("NK", "NK Proliferating", "NK_CD56bright"))
+names(ct) <- c("all","CD14", "B", "NK")
+
+CRISPR.validations.zscores.l <- lapply(names(ct), function(i){
+
+  if (i == "all") { # pseudo-bulk stats
+      sub.ct <- pbmc
+  }
+  else{ # celltype subsetted stats
+    sub.ct <- subset(pbmc, idents = ct[[i]])
+  }
+  # set.seed(2022)
+  DefaultAssay(sub.ct) <- "peaks2"
+  
+  # compute peaks stats
+  sub.ct <- RegionStats(sub.ct, genome = BSgenome.Hsapiens.UCSC.hg38)
+  
+  # compute log of ATACseq peaks counts for better matching
+  sub.ct@assays$peaks2@meta.features$logcount <- log(rowSums(sub.ct@assays$peaks2@counts)+1)
+
+  # Get background peaks
+  validation.peaks.unique <- CRISPR.validation$peak %>% unique()
+  l.bg.peaks <- lapply(validation.peaks.unique, function(x) {
+    get_bg_peaks(meta.bg = sub.ct@assays$peaks2@meta.features,
+                 my_peak = x,
+                 n_sample = 200)
+  })
+  names(l.bg.peaks) <- validation.peaks.unique
+  
+  # set matrices for Pearson tests
+  validation.genes <- CRISPR.validation$gene %>% unique()
+  
+  gene.mat <- sub.ct@assays$RNA@data[validation.genes,]
+  peak.mat <- sub.ct@assays$peaks2@counts
+  
+  # Run pearson correlations for all peaks linked to a gene
+  CRISPR.validations.zscores <- lapply(1:length(validation.genes), function(x){
+    
+    Linkpeaks.preset.pairs(totest = CRISPR.validation, # has peak and gene_peak columns
+                           l.bg.peaks = l.bg.peaks,
+                           my_gene = validation.genes[x],
+                           n_sample = 200,
+                           peak.mat = peak.mat,
+                           gene.mat = gene.mat)
+  })
+  
+  CRISPR.validations.zscores.df <- do.call(rbind,CRISPR.validations.zscores)
+  CRISPR.validations.zscores.df$celltype <- i
+
+  ############ ZINB by celltype
+  # cellular detection rate as covariate
+  cdr.peaks  <- scale(
+    colSums(sub.ct[["peaks2"]]@counts != 0) / nrow(sub.ct[["peaks2"]]@counts)
+  )
+  
+  cdr.genes <- scale(
+    colSums(sub.ct[["RNA"]]@counts != 0) / nrow(sub.ct[["RNA"]]@counts)
+  )
+  # count data
+  gene.mat <- sub.ct@assays$RNA@counts[validation.genes,]
+  
+  ################################ 
+  options(future.globals.maxSize=2e9)
+  plan(multiprocess, workers = 6)
+  
+  tictoc::tic()
+  ZINB.stats.l <- future.apply::future_lapply(1:nrow(CRISPR.validations.zscores.df), function(x){
+
+    my_gene <- CRISPR.validations.zscores.df[x,"gene"]
+    my_peak <- CRISPR.validations.zscores.df[x,"peak"]
+    
+    gene_counts <- gene.mat[my_gene, ] 
+    peak_counts <- peak.mat[my_peak,]
+    
+    non_zero.cells <- names(gene_counts[gene_counts > 0])
+    non_zero.cells <- which(peak_counts[non_zero.cells] > 0)
+    
+    # If there are less than 2 cells with counts in the gene and peak output NA
+    # this is to avoid errors from zeroinfl()
+    if (length(non_zero.cells) > 1) {
+      
+      # If there are no cells with 0 counts, use glm.nb
+      if(min(gene_counts) > 0){
+        S <- MASS::glm.nb(gene_counts ~ peak_counts + cdr.peaks + cdr.genes) %>% 
+          summary() 
+        coef <- S$coefficients[2,]
+      }
+      else{
+        # ZINB model
+        S <- pscl::zeroinfl(gene_counts ~ 
+                              peak_counts + cdr.peaks + cdr.genes | 
+                              cdr.peaks + cdr.genes, 
+                            dist = 'negbin') %>% 
+          summary() 
+        coef <- S$coefficients$count[2,]
+      }
+      c(coef, paste0(my_gene, "_", my_peak))
+    }
+    else{
+      c(rep(NA,4), paste0(my_gene, "_", my_peak))
+    }
+    
+  })
+  tictoc::toc() 
+  ################################ 
+
+  ZINB.stats <- do.call("rbind", ZINB.stats.l)
+  colnames(ZINB.stats) <- c("ZINB_Estimate","ZINB_Std.Error","ZINB_Zvalue","ZINB_P", "gene_peak")
+  ZINB.stats <- as.data.frame(ZINB.stats)
+  ZINB.stats[,1:4] <- apply(ZINB.stats[,1:4],2,as.numeric)
+  
+  CRISPR.validations.zscores.df <- merge(CRISPR.validations.zscores.df, ZINB.stats, by="gene_peak", all=T)
+  CRISPR.validations.zscores.df
+})
+
+CRISPR.validations.zscores.by.ct <- do.call(rbind,CRISPR.validations.zscores.l)
+saveRDS(CRISPR.validations.zscores.by.ct,"../results/CRISPR.validation_celltype_subsetted_ZINB.rds")
+```
+
+
+

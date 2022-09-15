@@ -1,0 +1,524 @@
+---
+title: "2.Bimodality"
+author: "Francis Leblanc"
+date: "22/06/2022"
+output:   
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: true
+    code_folding: hide 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+library(Seurat)
+library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(Nebulosa)
+library(dendextend)
+library(rstatix)
+
+source("../R/LinkPeaks2.R") # modified from : https://github.com/timoast/signac/blob/master/R/links.R
+# added multicore implementation for windows and the use of logcounts in MatchRegionStats()
+# lines 193 & 233
+source("../R/multimodality.R")
+
+theme_set(theme_cowplot())
+set.seed(2022)
+```
+
+
+# Cells Archetypes
+
+```{r}
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+
+# keep only celltypes with 50 > cells
+# lowly represented celltypes creates unreliable AUCs
+ct.count <- readRDS("../data/ct.count.rds")
+top.ct <- names(ct.count[ct.count > 50])
+
+# compute average expression by cell for dendrogram
+pbmc$top.ct <- ifelse(pbmc$predicted.id %in% top.ct, pbmc$predicted.id, "other")
+PseudoBulk <- AverageExpression(object = pbmc, 
+                                assays = "RNA", 
+                                group.by = "top.ct")
+PseudoBulk <- PseudoBulk$RNA %>% as.data.frame()
+
+# make dendrogram
+dend <- PseudoBulk %>% 
+  select(-other) %>% 
+  t() %>% 
+  scale %>% 
+  dist %>% 
+  hclust %>% 
+  as.dendrogram %>% 
+  hang.dendrogram(hang_height = 10)
+
+ggd1 <- as.ggdend(dend)
+p <- ggplot(ggd1, horiz = TRUE, offset_labels = -5)
+
+ggsave(plot = p,"../figs/2_out/celltypes_dendogram_RNA.png", width = 7, height = 5)
+```
+
+# Label peaks called by cells Archetypes
+
+```{r}
+# Macs2 celltype specific peak calls
+peaks <- readRDS("../data/signac_peaks.rds")
+peaks$peaks <- GRangesToString(peaks)
+
+# compute peaks stats
+DefaultAssay(pbmc) <- "peaks2"
+pbmc <- RegionStats(pbmc, genome = BSgenome.Hsapiens.UCSC.hg38)
+peaks.meta <- pbmc@assays$peaks2@meta.features
+peaks.meta$peak_called_in <- peaks$peak_called_in[match(
+  row.names(peaks.meta), 
+  peaks$peaks
+  )]
+
+# label peaks called in 4 general Archetypes Monocyte, NK, B, and Lymphoid
+peaks.meta$peak_called_in <- gsub("CD8_Naive|CD4_Naive|CD4_TCM|CD8_TEM|CD8_TCM|CD4_TEM|MAIT|Treg",
+                                  "Lymp",
+                                  x = peaks.meta$peak_called_in)
+
+peaks.meta$peak_called_in <- gsub("gdT|NK|CD8_TEM|MAIT",
+                                  "NK", 
+                                  x = peaks.meta$peak_called_in)
+peaks.meta$peak_called_in <- gsub("CD14_Mono|CD16_Mono|cDC2|pDC",
+                                  "Mono", 
+                                  x = peaks.meta$peak_called_in)
+peaks.meta$peak_called_in <- gsub("B_intermediate|B_memory|B_naive",
+                                  "B_cell", 
+                                  x = peaks.meta$peak_called_in)
+
+
+called_in.archetype <- lapply(peaks.meta$peak_called_in, function(x){
+  c("Lymp","NK","Mono","B_cell") %in% (unlist(strsplit(x = x, ",")))}
+  )
+
+require(purrr)
+called_in.archetype <- map_df(called_in.archetype, ~as.data.frame(t(.)))
+colnames(called_in.archetype) <- c("Lymp","NK","Mono","B_cell")
+row.names(called_in.archetype) <- row.names(peaks.meta)
+
+# count the number of archetypes the peak was called in
+called_in.archetype$peak_call_count <- rowSums(called_in.archetype)
+peaks.meta <- cbind(peaks.meta, called_in.archetype[row.names(peaks.meta),])
+peaks.meta$logcount <- log(rowSums(pbmc@assays$peaks2@counts)+1)
+
+saveRDS(peaks.meta,"../results/peaks.meta.features_archetype.rds")
+```
+
+
+# Fig. 1 - Effects of bimodality on Z-scores at the NOD2 locus
+
+```{r}
+peaks.meta <- readRDS("../results/peaks.meta.features_archetype.rds")
+links0.01 <- readRDS("../results/Granges_links_signac_200null.r0.01.rds") %>% 
+  as.data.frame()
+
+# top NOD2 links
+nod2 <- links0.01 %>% dplyr::filter(gene=="NOD2" &
+                                      width < 30000 & 
+                                      abs(score) > 0.075) %>% 
+  arrange(desc(score))
+
+
+# get null distributions for the top 3 links for NOD2
+all_bg.peaks <- lapply(1:3, function(x){
+  links_distributions(
+    my_peak = nod2$peak[x],
+    my_gene = nod2$gene[x], 
+    n_sample = 1000,
+    RNA.matrix = pbmc[["RNA"]]@data,
+    peaks.matrix = pbmc[["peaks2"]]@counts,
+    meta = peaks.meta,
+    remove_cor.peaks = F
+  )
+}) %>% bind_rows() 
+all_bg.peaks$type <- "All.bg.peaks"
+
+# get null distributions for the top 3 links for NOD2 
+# without trans peaks highly expressed in the celltype in which the cCRE is
+no.cor_bg.peaks <- lapply(1:3, function(x){
+  links_distributions(
+    my_peak = nod2$peak[x],
+    my_gene = nod2$gene[x], 
+    n_sample = 1000,
+    RNA.matrix = pbmc[["RNA"]]@data,
+    peaks.matrix = pbmc[["peaks2"]]@counts,
+    meta = peaks.meta,
+    remove_cor.peaks = T
+  )
+}) %>% bind_rows()
+no.cor_bg.peaks$type <- "No.specific.bg.peaks"
+
+
+# plot density with all trans peaks as possible draw in null
+## add cCRE zscore as label
+all_bg.peaks$z.test <- NA
+idx <- seq(1, 2001, by = 1000)
+all_bg.peaks$z.test[idx] <- all_bg.peaks$z[idx] %>% round(3)
+all_bg.peaks$z.test.lab <- NA
+all_bg.peaks$z.test.lab[idx] <- all_bg.peaks$z[idx] %>% 
+  round(3) %>% 
+  as.character()
+
+p0 <- ggplot(all_bg.peaks, aes(x=bg.z, y=gene_peak, group=gene_peak)) +
+  ggridges::geom_density_ridges(stat = "binline", 
+                                binwidth = 0.1, 
+                                fill = "black", 
+                                alpha = 0.5, 
+                                scale = 3) +
+  ggrepel::geom_label_repel(aes(x = z.test, label = z.test.lab),
+                            colour="black", 
+                            size=4, 
+                            nudge_x = .15, 
+                            nudge_y = 0.5, 
+                            segment.ncp = 3, 
+                            alpha = 0.8,
+                            segment.colour = "darkred", 
+                            segment.size = 1) +
+  xlab("Z-scores of Pearson R") +
+  ylab("") + 
+  ggtitle(expression(paste("All ", 
+                           italic("trans"), 
+                           "-peaks in null distribution")))
+
+ggsave(plot = p0, "../figs/2_out/density_NOD2_biomodality_all.peaks.in.null.png", width = 8, height = 4)
+
+
+# plot density with subsetted trans peaks draw in null
+no.cor_bg.peaks$z.test <- NA
+no.cor_bg.peaks$z.test[idx] <- no.cor_bg.peaks$z[idx] %>% round(3)
+no.cor_bg.peaks$z.test.lab <- NA
+no.cor_bg.peaks$z.test.lab[idx] <- no.cor_bg.peaks$z[idx] %>% 
+  round(3) %>% 
+  as.character()
+
+p1 <- ggplot(no.cor_bg.peaks, aes(x=bg.z, y=gene_peak, group=gene_peak)) +
+  ggridges::geom_density_ridges(stat = "binline", 
+                                binwidth = 0.1, 
+                                fill = "black", 
+                                alpha = 0.5, 
+                                scale = 3) +
+  ggrepel::geom_label_repel(aes(x = z.test, label = z.test.lab),
+                            colour="black", 
+                            size=4, 
+                            nudge_x = .15, 
+                            nudge_y = 0.5, 
+                            segment.ncp = 3, 
+                            alpha = 0.8,
+                            segment.colour = "darkred", 
+                            segment.size = 1) +
+  xlab("Z-scores of Pearson R") +
+  ylab("") + 
+  ggtitle(expression(paste("No cell-type specific ", 
+                           italic("trans"), 
+                           "-peak in null distribution")))
+
+ggsave(plot = p1, "../figs/2_out/density_NOD2_biomodality_no.cor.peaks.in.null.png", width = 8, height = 4)
+```
+
+
+# Bimodality test for all links
+
+```{r}
+# pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+# peaks.meta <- readRDS("../results/peaks.meta.features_archetype.rds")
+
+links0.1 <- links0.01 %>% 
+  dplyr::filter(abs(score) > 0.1) %>% arrange(desc(score))
+
+RNA.matrix <- pbmc[["RNA"]]@data
+peaks.matrix <- pbmc[["peaks2"]]@counts
+rm(pbmc)
+
+options(future.globals.maxSize=3e9)
+plan(multiprocess, workers = 6)
+
+# test for multiple modes with multimode::modetest default settings
+tictoc::tic()
+df.modes <- future.apply::future_sapply(1:nrow(links0.1), function(x){
+  bimodality_test(
+    my_peak = links0.1$peak[x],
+    my_gene = links0.1$gene[x],
+    n_sample = 2000,
+    RNA.matrix = RNA.matrix,
+    peaks.matrix = peaks.matrix,
+    meta = peaks.meta
+  )
+})
+tictoc::toc() # 4098.79 sec elapsed
+
+
+df.modes.t <- df.modes %>% t() %>% as.data.frame()
+df.modes.t$H0.p <- df.modes.t$H0.p %>% as.numeric()
+
+links0.1$gene_peak <- paste0(links0.1$gene, "_", links0.1$peak)
+
+links0.1 <- merge(links0.1, df.modes.t, by = "gene_peak")
+
+links0.1$multimodal <- links0.1$H0.p <= 0.05
+saveRDS(links0.1, "../results/links_signac_200null.r0.1.multimode.rds")
+```
+
+# Fig. 2
+## Pearson R & Z-scores vs multimodal nulls
+
+```{r}
+links0.1 <- readRDS("../results/links_signac_200null.r0.1.multimode.rds")
+
+# test for Zscore association with multimodes 
+p <- ggplot(links0.1, aes(x = multimodal, y = abs(zscore))) + 
+  geom_jitter(shape = ".") + 
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) + 
+  scale_y_log10() +
+  ylab("|Z-score|")
+
+links0.1$abs_zscore <- abs(links0.1$zscore)
+
+stat.test <- links0.1 %>% 
+  wilcox_test(abs_zscore ~ multimodal) %>% 
+  add_significance() 
+
+p <- p + 
+  annotate("text", 
+           size = 2.5,
+           # lowest p-value returned was 4e-302 
+           label = paste0("Wilcoxon P-value < 1e-300"), 
+           y = 29, 
+           x = 1.5, 
+           fontface = 'italic')
+
+# test for Pearson R association with multimodes
+p2 <- ggplot(links0.1, aes(x=multimodal, y=abs(score))) + 
+  geom_jitter(shape=".") +
+  geom_boxplot(alpha=0.7,outlier.shape = NA)+
+  scale_y_log10() +
+  ylab("|Pearson R|")
+
+links0.1$abs_score <- abs(links0.1$score)
+
+stat.test <- links0.1 %>% 
+  wilcox_test(abs_score ~ multimodal) %>% 
+  add_significance()
+
+p2 <- p2 + 
+  annotate("text", 
+           size = 2.5,
+           label = paste0("Wilcoxon P-value = ", stat.test$p),
+           y = 0.55, 
+           x = 1.5, 
+           fontface = 'italic')
+
+ggsave(plot = p | p2,"../figs/2_out/boxplot_multimodality.vs.zscores.png", width = 5, height = 5)
+```
+
+## Bimodality scatter Zcore vs Pearson
+
+```{r}
+p <- ggplot(links0.1, aes(score, 
+                          zscore, 
+                          # replace 0 with min H0.p to avoid inf
+                          color = -log10(H0.p + 0.001))) + 
+  geom_point(alpha = 0.5) + 
+  scale_color_viridis_c() +
+  labs(colour = "Multimode -log10(p)") +
+  ylab("Z-score") + xlab("Pearson R") +
+  theme(legend.position = c(0.1, 0.8)) 
+ggsave(plot = p, "../figs/2_out/scatter_bimodality_Z.vs.R.png", width = 6, height = 6)
+```
+
+## Bimodal peaks per celltype
+
+```{r}
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+# links0.1 <- readRDS("../results/links_signac_200null.r0.1.multimode.rds")
+
+# get AUC for each peak to label link by celltype
+markers_peaks <- presto:::wilcoxauc.Seurat(X = pbmc, 
+                                           group_by = 'predicted.id', 
+                                           assay = 'data', 
+                                           seurat_assay = 'peaks2')
+
+markers_peaks.f <- markers_peaks %>% 
+  dplyr::filter(feature %in% links0.1$peak & 
+                  padj < 0.00001 & 
+                  auc > 0.55 & 
+                  group %in% top.ct) %>%
+  arrange(desc(auc)) %>% 
+  distinct(feature,.keep_all = T)
+
+links0.1$ct_top_auc <- markers_peaks.f$group[match(
+  links0.1$peak, 
+  markers_peaks.f$feature)]
+
+links0.1$ct_top_auc <- links0.1$ct_top_auc %>% 
+  replace_na("Not specific") %>% 
+  factor()
+saveRDS(links0.1, "../results/links_signac_200null.r0.1.multimode.rds")
+
+# Compute % multimodal by celltype
+bimod.count <- links0.1 %>% 
+  group_by(ct_top_auc, .drop = FALSE) %>% 
+  tally(multimodal) 
+
+bimod.count$ct_marker.count <- links0.1 %>% 
+  group_by(ct_top_auc) %>% 
+  tally() %>% 
+  pull(n)
+
+bimod.count$bimod.pct <- round((100 * bimod.count$n) / bimod.count$ct_marker.count)
+bimod.count <- bimod.count %>% 
+  arrange(desc(bimod.pct)) %>%
+  mutate(ct_top_auc = factor(ct_top_auc, levels = ct_top_auc))
+
+# order by median Z-scores
+lvs.by.median <- links0.1 %>% 
+  group_by(ct_top_auc) %>% 
+  summarise(median = median(abs(zscore))) %>% 
+  arrange(median) %>% 
+  pull(ct_top_auc)
+
+lvs.by.median <- recode(lvs.by.median, not.specific = "Not specific")
+links0.1$ct_top_auc <- factor(links0.1$ct_top_auc, 
+                              levels = lvs.by.median)
+
+# show % multimodal nulls and number of links by celltype
+p <- ggplot(links0.1, aes(x=ct_top_auc, fill=multimodal)) + 
+  geom_histogram(stat="count") +
+  annotate("text",
+           x = bimod.count$ct_top_auc,
+           y = bimod.count$n + 300,
+           label = paste0(bimod.count$bimod.pct, "%")) + 
+  ylab("Peak count") + xlab("") +
+  ggpubr::rotate() + 
+  scale_fill_manual(values = c("lightgray","black")) +
+  theme(legend.position = c(0.5, 0.5))
+
+ggsave(plot = p, "../figs/2_out/multimodality_by_ct.png", width = 4.5, height = 5)
+```
+
+
+# Fig. S4 - Top examples of bimodal nulls
+
+```{r}
+# links0.1 <- readRDS("../results/links_signac_200null.r0.1.multimode.rds")
+# peaks.meta <- readRDS("../results/peaks.meta.features_archetype.rds")
+specific.peaks <- peaks.meta %>% 
+  dplyr::filter(peak_call_count < 4) %>% 
+  row.names()
+
+# top NOD2 links
+bimod.examples <- links0.1 %>% dplyr::filter(H0.p == 0 & 
+                                               abs(zscore) < 1.65 & 
+                                               peak %in% specific.peaks) %>% 
+  arrange(desc(score))
+
+
+# get null distributions for the top 3 links for NOD2
+all_bg.peaks <- lapply(1:4, function(x){
+  links_distributions(
+    my_peak = bimod.examples$peak[x],
+    my_gene = bimod.examples$gene[x], 
+    n_sample = 1000,
+    RNA.matrix = pbmc[["RNA"]]@data,
+    peaks.matrix = pbmc[["peaks2"]]@counts,
+    meta = peaks.meta,
+    remove_cor.peaks = F
+  )
+}) %>% bind_rows() 
+all_bg.peaks$type <- "All.bg.peaks"
+
+# get null distributions for the top 3 links for NOD2 
+# without trans peaks highly expressed in the celltype in which the cCRE is
+no.cor_bg.peaks <- lapply(1:4, function(x){
+  links_distributions(
+    my_peak = bimod.examples$peak[x],
+    my_gene = bimod.examples$gene[x], 
+    n_sample = 1000,
+    RNA.matrix = pbmc[["RNA"]]@data,
+    peaks.matrix = pbmc[["peaks2"]]@counts,
+    meta = peaks.meta,
+    remove_cor.peaks = T
+  )
+}) %>% bind_rows()
+no.cor_bg.peaks$type <- "No.specific.bg.peaks"
+
+
+# plot density with all trans peaks as possible draw in null
+## add cCRE zscore as label
+all_bg.peaks$z.test <- NA
+idx <- seq(1, 3001, by = 1000)
+all_bg.peaks$z.test[idx] <- all_bg.peaks$z[idx] %>% 
+  round(3)
+all_bg.peaks$z.test.lab <- NA
+all_bg.peaks$z.test.lab[idx] <- all_bg.peaks$z[idx] %>% 
+  round(3) %>% 
+  as.character()
+
+p0 <- ggplot(all_bg.peaks, aes(x=bg.z, y=gene_peak, group=gene_peak)) +
+  ggridges::geom_density_ridges(stat = "binline", 
+                                binwidth = 0.1, 
+                                fill = "black", 
+                                alpha = 0.5, 
+                                scale = 3) +
+  ggrepel::geom_label_repel(aes(x = z.test, label = z.test.lab),
+                            colour="black", 
+                            size=4, 
+                            nudge_x = .15, 
+                            nudge_y = 0.75, 
+                            segment.ncp = 3, 
+                            alpha = 0.8,
+                            segment.colour = "darkred", 
+                            segment.size = 1) +
+  ylab("") + xlab("") +
+  ggtitle("All peaks in background")
+
+# plot density with subsetted trans peaks draw in null
+no.cor_bg.peaks$z.test <- NA
+no.cor_bg.peaks$z.test[idx] <- no.cor_bg.peaks$z[idx] %>% 
+  round(3)
+no.cor_bg.peaks$z.test.lab <- NA
+no.cor_bg.peaks$z.test.lab[idx] <- no.cor_bg.peaks$z[idx] %>% 
+  round(3) %>% 
+  as.character()
+
+p1 <- ggplot(no.cor_bg.peaks, aes(x=bg.z, y=gene_peak, group=gene_peak)) +
+  ggridges::geom_density_ridges(stat = "binline", 
+                                binwidth = 0.1, 
+                                fill = "black", 
+                                alpha = 0.5, 
+                                scale = 3) +
+  ggrepel::geom_label_repel(aes(x = z.test, label = z.test.lab),
+                            colour="black", 
+                            size=4, 
+                            nudge_x = .15, 
+                            nudge_y = 0.75, 
+                            segment.ncp = 3, 
+                            alpha = 0.8,
+                            segment.colour = "darkred", 
+                            segment.size = 1) +
+  xlab("Z-scores of Pearson R") +
+  ylab("") + 
+  ggtitle("No specific peaks in background")
+
+p <- p0/p1 + plot_annotation(caption = "Null distributions of 1000 matching peaks")
+ggsave(plot = p, "../figs/2_out/density_biomodality_4examples.png", width = 7, height = 7)
+```
+
+```{r}
+sessionInfo()
+```
