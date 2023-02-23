@@ -99,7 +99,7 @@ colnames(df) <- c("ct","freq")
 
 df <- df %>% dplyr::filter(ct %in% top.ct)
 df$ct <- factor(df$ct, levels = lvs.by.median)
-df[18,] <- c("not.specific", 0) # not.specific peaks
+df[18,] <- c("Not specific", 0) # Not specific peaks
 
 p.bar <- ggplot(df ,aes(x = ct, y = as.numeric(freq))) + 
   geom_col() + 
@@ -322,7 +322,7 @@ lapply(ct.epimap, function(i){
             links0.1$gene_peak %>% unique())
   names(l_upset) <- c(paste0("Epimap ", ct ," predictions"), 
                 paste0("Subsetted ", ct ," links"), 
-                "Pseudo-bulk PBMC links")
+                "All PBMC links")
   
   # save plot
   png(paste0("../figs/5_out/upset.Epimap_",ct,".png"), res = 600, width = 6, height = 4, units = "in")

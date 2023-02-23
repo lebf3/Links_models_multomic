@@ -25,7 +25,7 @@ Epimap_to_Grange <- function(epimap_celltype = "CD14 MONOCYTE", epi.meta = Epi.m
   # keep gene peak links present in all replicates
   keep.gene_peak <- epi.links %>% 
     group_by(gene_peak) %>% 
-    count() %>% 
+    dplyr::count() %>% 
     dplyr::filter(n == length(epi.samples)) %>% 
     pull(gene_peak)
   

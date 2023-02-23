@@ -1,0 +1,160 @@
+---
+title: "PCHi-C"
+author: "Francis Leblanc"
+date: '2023-01-08'
+output:   
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: true
+    code_folding: hide 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+library(Seurat)
+library(Signac)
+library(tidyverse)
+library(AnnotationHub)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(cowplot)
+theme_set(theme_cowplot())
+```
+
+# PCHI-C experiment
+## Process data
+```{r}
+pbmc <- readRDS("../data/pbmc_multiome_processed.rds")
+genes <- pbmc@assays$RNA@counts %>% row.names()
+
+# Supplementary data (Data S1) from BM Javierre et al., Cell, 2016
+baits <- rio::import("../data/PCHi-C/PCHiC_peak_matrix_cutoff5.tsv")
+
+# remove bait-bait and > 500kb links
+baits.500kb <- baits %>% dplyr::filter(abs(dist) < 500000 &
+                                         oeName == ".")
+# filter out links that have multiple genes (count only the ones in PBMC)
+gene.ol <- lapply(baits.500kb$baitName, function(x){
+  intersect(strsplit(x, ";")[[1]], genes)
+})
+baits.500kb$nb_genes <- lapply(gene.ol, length) %>% unlist()
+baits.500kb.1gene <- baits.500kb %>% dplyr::filter(nb_genes == 1)
+
+# replace gene column with the one gene found in PBMC
+gene.ol <- lapply(baits.500kb.1gene$baitName, function(x){
+  intersect(strsplit(x, ";")[[1]], genes)
+}) %>% unlist()
+baits.500kb.1gene$gene.name <- gene.ol
+
+# liftover to hg38
+ahub <- AnnotationHub()
+ahub.chain <- subset(ahub, rdataclass == "ChainFile" & species == "Homo sapiens")
+chain <- ahub.chain[ahub.chain$title == "hg19ToHg38.over.chain.gz"]
+chain <- chain[[1]]
+
+baits.500kb.1gene$chr <- paste0("chr",baits.500kb.1gene$oeChr)
+GR.baits <- makeGRangesFromDataFrame(baits.500kb.1gene, keep.extra.columns = T, 
+                                   seqnames.field = "chr",
+                                   start.field = "oeStart",
+                                   end.field = "oeEnd")
+
+grl2.hg38 <- liftOver(GR.baits, chain)
+grl2.hg38 <- unlist(grl2.hg38)
+grl2.hg38$peak_hg38 <- GRangesToString(grl2.hg38)
+
+# label peaks overlaping with Epimap predicted cCREs
+links0.01 <- readRDS("../results/Granges_links_signac_200null.r0.01.rds")
+links0.01$gene_peak <- paste0(links0.01$gene,"_",links0.01$peak)
+
+# change ranges from links to peaks 
+# (the links Grange object has start and end matching the peak and the gene tss)
+# here we need start end to match the peak boundaries
+peak.gr.links0.01 <- StringToGRanges(links0.01$peak)
+peak.gr.links0.01@elementMetadata <- links0.01@elementMetadata
+
+# Label PCHi-C validations that overlaps with links tested (Pearson R > 0.01)
+ol <- findOverlaps(grl2.hg38, peak.gr.links0.01) %>% as.data.frame()
+
+# merge dataframes
+links0.01_PCHiC <- cbind(grl2.hg38@elementMetadata[ol$queryHits,],
+                          peak.gr.links0.01@elementMetadata[ol$subjectHits,]) %>% 
+  as.data.frame()
+
+# keep overlapping peaks with same gene
+keep <- which(links0.01_PCHiC$gene == links0.01_PCHiC$gene.name)
+links0.01_PCHiC <- links0.01_PCHiC[keep,]
+
+peak.gr.links0.01$is.PCHIC <- ifelse(peak.gr.links0.01$gene_peak %in% links0.01_PCHiC$gene_peak, T, F)
+
+# get distances 
+# reassign widths as distance between tss and peak
+peak.gr.links0.01$link.width <- BiocGenerics::width(links0.01[match(
+  peak.gr.links0.01$gene_peak,
+  links0.01$gene_peak
+)])
+
+# Keep only links for which a bait targeting the gene was present in PCHi-C
+peak.gr.links0.01.tested <- peak.gr.links0.01@elementMetadata %>%
+  as.data.frame() %>%
+  dplyr::filter(gene %in% baits.500kb.1gene$gene.name)
+```
+
+## Plot AUCs
+
+```{r}
+library(ROCR)
+tests <- list(c("zscore","Z-scores"),
+              c("score","Pearson R"),
+              c("Pearson_dist", "Pearson * wDist"),
+              c("dist", "1/Distance"))
+
+peak.gr.links0.01.tested$dist <- 1/peak.gr.links0.01.tested$link.width
+peak.gr.links0.01.tested$Pearson_dist <- peak.gr.links0.01.tested$score * (exp(-peak.gr.links0.01.tested$link.width/200000))
+
+# compute AUC for all 4 metrics
+l.df <- lapply(tests, function(test){
+  peak.gr.links0.01.tested.sub <- peak.gr.links0.01.tested[!is.na(peak.gr.links0.01.tested[[test[1]]]),]
+  
+  pred_ROCR <- prediction(abs(peak.gr.links0.01.tested.sub[[test[1]]]), peak.gr.links0.01.tested.sub[["is.PCHIC"]])
+  roc_ROCR <- performance(pred_ROCR, measure = "tpr", x.measure = "fpr")
+  auc_ROCR <- performance(pred_ROCR, measure = "auc")
+  
+  data.frame(FPR = roc_ROCR@x.values[[1]], 
+             TPR = roc_ROCR@y.values[[1]], 
+             test = test[2],
+             AUC = auc_ROCR@y.values[[1]])
+})
+df <- do.call(rbind,l.df)
+
+# pull AUC data to add in ggplot
+AUCs <- df %>% 
+  group_by(AUC,test) %>% 
+  summarise() %>% 
+  arrange(desc(AUC)) %>% 
+  as.data.frame()
+df$test <- factor(df$test, levels = AUCs$test)
+AUCs$AUC <- AUCs$AUC %>% round(3)
+
+# create labels for ggplot colors
+AUCs.labs <- c()
+for (i in 1:nrow(AUCs)) {
+  AUCs.labs <- c(AUCs.labs, paste0(AUCs[i,"test"], " = ", AUCs[i,"AUC"]))
+}
+
+# reuse colours from Figure 4
+cols <- c("#FF7856","#490092","#00F100","#999999","#FF50FF","#666666","#333333","#3FA0FF")
+names(cols) <- c('Pearson * wDist', '1/Distance', 'Pearson R', 'RegNMF B_cell', 'ZINB', 'RegNMF_score_NK', 'RegNMF_score_CD14 Mono', 'Z-scores')
+
+ggplot(df, aes(FPR ,TPR, colour = test)) +
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  theme(legend.position = c(0.55, 0.3)) + 
+  scale_color_manual(values = cols[AUCs$test], labels = AUCs.labs) +
+  labs(colour = "AUC") 
+ggsave("../figs/PCHi-C_AUC.png", width = 7, height = 7)
+```

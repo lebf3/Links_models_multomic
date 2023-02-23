@@ -7,6 +7,11 @@ data/raw/
 data/pbmc_multiome_processed.rds
 data/pbmc500.mono.rds
 results/benchmark/
+results/rebuttal/
 results/RegNMF/
 !results/RegNMF/RegNMF.scores_pbmc_links_hits.rds
 analyses/Benchmarking.rmd
+data/PCHi-C/
+figs/rebuttal/
+analyses/Rebuttal.rmd
+analyses/2.Bimodality.rebuttal.rmd
